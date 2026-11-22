@@ -13,28 +13,88 @@ A CrossPoint / CrossInk SD-card plugin that syncs reading progress, per-session 
 - **Browse SD Library & Session History Import:** Link older or already-finished books directly from your SD card, or import historical sessions from CrossPoint Sync exports, `reading-history.json`, or `events.jsonl`.
 - **Privacy-first storage:** StoryGraph session cookies stay strictly in browser `localStorage` and are never written to the microSD card.
 
-## Installation
+---
 
-### Option 1 — CrossPoint Plugin Hub (Recommended)
+## Setup Guide
 
-1. Open **Home → Plugins → Plugin Hub** on your e-reader (or the Plugin Hub WebUI).
-2. Find **StoryGraph Sync** under **Community Plugins** and install it.
-3. **Reboot once** so firmware registers `reader.exit` and `reader.session` event subscriptions.
+### 1. Install the Plugin
 
-### Option 2 — Manual SD Install
+#### Option A — CrossPoint Plugin Hub (Recommended)
+1. Enable **Settings → System → Plugins** (or **Connectivity → Plugins**) on your e-reader.
+2. Open **Home → Plugins → Plugin Hub** (or the Plugin Hub WebUI).
+3. Find **StoryGraph Sync** under **Community Plugins** and click **Install**.
+4. **Reboot your e-reader once** so firmware registers the `reader.exit` and `reader.session` event subscriptions.
 
-1. Copy the contents of [`storygraph-sync.crosspoint-plugin/`](storygraph-sync.crosspoint-plugin/) into `/.crosspoint/plugins/storygraph-sync/` on your microSD card.
-2. Enable **Plugins** in device settings and **reboot once**.
+#### Option B — Manual SD Card Install
+1. Connect your e-reader in **USB Drive** mode (or insert the microSD card into your computer).
+2. Copy the contents of [`storygraph-sync.crosspoint-plugin/`](storygraph-sync.crosspoint-plugin/) into:
+   ```text
+   /.crosspoint/plugins/storygraph-sync/
+   ```
+3. Eject safely, enable **Plugins** in device settings, and **reboot once**.
 
-See [`storygraph-sync.crosspoint-plugin/README.md`](storygraph-sync.crosspoint-plugin/README.md) for full cookie setup and usage instructions.
+---
+
+### 2. Record Your First Reading Event
+
+Open any book on your e-reader, read a few pages, and exit back to Home. Firmware automatically records your progress and sitting details to `/.crosspoint/plugins/storygraph-sync/events.jsonl` (without waking Wi-Fi during sleep).
+
+---
+
+### 3. Connect Your StoryGraph Account (Browser Cookies)
+
+Because The StoryGraph does not offer a public API, the plugin signs requests using your existing browser session cookies:
+
+1. Log in to `https://app.thestorygraph.com/` in your desktop browser (ideally on the same non-VPN network as your e-reader if Cloudflare challenges requests).
+2. Open DevTools (**F12**) → **Network** tab → reload (**F5**).
+3. Click the main `app.thestorygraph.com` document request → **Request Headers** → copy the full `cookie` header value (it must include `_storygraph_session`, plus `cf_clearance` if present).
+4. Start **File Transfer** on your e-reader and open `http://crosspoint.local/files` in your browser.
+   - *Tip:* Using `http://crosspoint.local/files` instead of a raw IP keeps your browser `localStorage` cookies intact even if your router assigns a new DHCP IP later.
+5. Scroll to the **StoryGraph Sync** card, expand **Account Settings**, and:
+   - Paste your `cookie` header into **StoryGraph Cookie header**.
+   - Confirm **User-Agent** matches your browser (auto-filled by default).
+   - *(Optional)* Set **Journal device label** (defaults to `CrossPoint`, e.g. `X4 Pro`) or uncheck **Include reading duration in StoryGraph journal notes** if you prefer blank journal notes.
+6. Click **Verify Session**. You should see a green confirmation with your StoryGraph **Current Reads** count.
+
+> **Security & Privacy Note:** Your session cookies are stored **only** in your browser's `localStorage` and are never written to the microSD card. `_storygraph_session` rotates automatically whenever StoryGraph sends `Set-Cookie`. Because firmware caps outbound request headers at `4,096` bytes / 16 headers, the plugin automatically trims non-essential cookies if your header is large (keeping `_storygraph_session`, `remember_user_token`, `cf_clearance`, and `__cf_bm`).
+
+---
+
+### 4. Link Books & Sync
+
+1. **Link books:** Click **Link Book** on any tracked book and match it using:
+   - **Current Reads** (one-click match from your StoryGraph shelf),
+   - **Search StoryGraph** (`/browse`), or
+   - **Book URL / ID** (`https://app.thestorygraph.com/books/<id>`).
+2. **Add older or already-finished books:** Expand **Browse SD Library**, navigate to a folder, and click **Add & Link**. Once linked, click **Mark Read** for finished books or leave them pre-linked for future sessions.
+3. **Sync progress & reading journal:**
+   - Click **Sync Now** on one book or **Sync All** in the header to push all pending reading sessions, progress updates, **Read** completions, and start/finish dates.
+   - Each sitting is recorded individually in StoryGraph's **Reading Journal** (e.g. `20:10–20:55 · 45m read on CrossPoint`).
+   - Use **Sync Dates** anytime to align start/finish dates for previously synced books.
+   - Use **Clean Journals** anytime to clean stray `0%` or un-ledgered duplicate `100%` journal artifacts while preserving all genuine reading sessions.
+   - Use **Compact Outbox** (or keep **Auto-compact after Sync All** enabled) to keep `events.jsonl` well under firmware's 4 KB outbox cap.
+
+---
+
+### 5. Troubleshooting
+
+- **Cloudflare 403 / 503 or "session expired":** Make sure your desktop browser and e-reader are on the same network (no VPN mismatch), reload `app.thestorygraph.com` in your browser, copy a fresh `cookie` header (including `cf_clearance`), and click **Verify Session**.
+- **No books appear after installing:** Make sure **Plugins** is enabled in device settings and you **rebooted once** after installing (firmware builds its event subscription table only at boot), then open and exit a book.
+- **Transient `/api/fetch` transport errors during batch operations:** The plugin automatically retries transient network/transport errors up to 2 times with backoff and caches verified-clean **Read** books to minimize consecutive TLS handshakes.
+
+---
 
 ## Optional: Historical SD Backfill
 
-If you want to backfill pre-plugin reading progress, durations, and dates from existing on-device EPUB caches (`/.crosspoint/epub_*/`), connect your e-reader in **USB Drive** mode and run:
+To backfill pre-plugin reading progress, durations, and dates from existing on-device EPUB caches (`/.crosspoint/epub_*/`), connect your e-reader in **USB Drive** mode and run:
 
 ```bash
 python backfill_sd.py --write-sd
 ```
+
+*(Pass `--sd-root E:\` if auto-detection doesn't find the drive.)* Eject safely, switch back to **File Transfer**, and reload `/files`.
+
+---
 
 ## Repository Structure
 
