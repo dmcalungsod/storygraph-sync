@@ -1323,23 +1323,39 @@
       const endPct = toFiniteNumber(vars.end_percent);
       const inReadFolder = isReadFolderPath(sdPath);
       const isReadZeroReset = inReadFolder && (rawPercent === null || rawPercent === 0);
-      const prev = byBook.get(sdPath);
+      const meta = extractFilenameMeta(sdPath);
+      let prev = byBook.get(sdPath);
+      if (!prev) {
+        const docHash = vars.document ? String(vars.document) : '';
+        for (const [oldKey, existing] of byBook.entries()) {
+          if (
+            (docHash && existing.documentHash && existing.documentHash === docHash) ||
+            (meta.normFilename && existing.normFilename === meta.normFilename)
+          ) {
+            prev = existing;
+            byBook.delete(oldKey);
+            break;
+          }
+        }
+      }
       let percent = isReadZeroReset ? 100 : rawPercent;
-      if (percent === 0 && prev && prev.percent !== null && prev.percent > 0) {
+      if (prev && prev.percent !== null && (percent === null || percent < prev.percent)) {
         percent = prev.percent;
       }
       const isFinished = endPct === 100 || percent === 100 || isReadZeroReset || (prev?.finished ?? false);
-      const meta = prev ? null : extractFilenameMeta(sdPath);
+      if (isFinished) {
+        percent = 100;
+      }
       const ts = toFiniteNumber(ev.ts) ?? toFiniteNumber(vars.end_time) ?? prev?.lastReadTs ?? null;
 
       byBook.set(sdPath, {
         sdPath,
-        filename: prev ? prev.filename : meta.filename,
-        title: prev ? prev.title : meta.title,
-        author: prev ? prev.author : meta.author,
-        normFilename: prev ? prev.normFilename : meta.normFilename,
-        normTitle: prev ? prev.normTitle : meta.normTitle,
-        normAuthor: prev ? prev.normAuthor : meta.normAuthor,
+        filename: meta.filename,
+        title: meta.title || (prev ? prev.title : ''),
+        author: meta.author || (prev ? prev.author : ''),
+        normFilename: meta.normFilename,
+        normTitle: meta.normTitle || (prev ? prev.normTitle : ''),
+        normAuthor: meta.normAuthor || (prev ? prev.normAuthor : ''),
         documentHash: vars.document || prev?.documentHash || '',
         percent: percent !== null ? percent : (prev?.percent ?? null),
         finished: isFinished,
@@ -1354,15 +1370,26 @@
     return byBook;
   }
 
-  function compactEventsJsonl(jsonlText) {
+  function compactEventsJsonl(jsonlText, historyData) {
     const reduced = reduceEventsJsonl(jsonlText);
     if (reduced.size === 0) return '\n';
     const lines = [];
     let idx = 1;
     for (const book of reduced.values()) {
+      let pct = book.percent;
+      let fin = Boolean(book.finished);
+      if (historyData && historyData.books) {
+        const hDays = getBookHistoryDays(historyData, { sdPath: book.sdPath });
+        for (const d of hDays) {
+          if (d.endPercent !== null && d.endPercent !== undefined && (pct === null || d.endPercent > pct)) {
+            pct = d.endPercent;
+          }
+        }
+        if (pct === 100) fin = true;
+      }
       const vars = { book: book.sdPath };
-      if (book.percent !== null) vars.percent = String(book.percent);
-      if (book.finished) vars.end_percent = '100';
+      if (pct !== null) vars.percent = String(pct);
+      if (fin) vars.end_percent = '100';
       if (book.documentHash) vars.document = book.documentHash;
       if (book.durationSeconds > 0) vars.duration_seconds = String(Math.round(book.durationSeconds));
       lines.push(
@@ -2385,6 +2412,18 @@
         return;
       }
 
+      const reachesHundred =
+        row.devicePercent === 100 ||
+        mapping.status === 'read' ||
+        unsynced.some((d) => d.endPercent !== null && d.endPercent >= 100);
+      if (reachesHundred) {
+        if (unsynced.some((d) => d.endPercent !== null && d.endPercent >= 100)) {
+          row.devicePercent = 100;
+        }
+        await syncBook(row);
+        return;
+      }
+
       await runExclusive(`Syncing reading journal for "${row.title}"...`, async () => {
         try {
           setSyncProgress(15, `Loading "${row.title}" & journal from StoryGraph...`);
@@ -2393,6 +2432,23 @@
           let pageInfo = parseStoryGraphBookPage(html, mapping.bookId);
           if (!pageInfo.csrf) throw new Error('Could not find fresh CSRF token on book page.');
           const activeBookUrl = `${BASE_URL}/books/${encodeURIComponent(pageInfo.bookId)}`;
+
+          if (pageInfo.status === 'read') {
+            let histMarked = false;
+            for (const d of unsynced) {
+              if (markHistoryDaySynced(historyData, row, d.date)) histMarked = true;
+            }
+            if (histMarked) await saveHistoryData();
+            mapping.status = 'read';
+            mapping.lastSyncedPercent = 100;
+            mapping.lastSyncedAt = new Date().toISOString();
+            await saveMapData();
+            renderBooks();
+            const msg = `"${row.title}" is already marked Read on StoryGraph.`;
+            setSyncProgress(100, msg);
+            setBanner(msg, 'muted');
+            return;
+          }
 
           if (pageInfo.status !== 'currently-reading' && pageInfo.status !== 'rereading' && pageInfo.status !== 'read') {
             setSyncProgress(35, `Setting Currently Reading for "${row.title}"...`);
@@ -2629,6 +2685,7 @@
           startDate: book.startDate || '',
           lastDate: book.lastDate || '',
           documentHash: book.documentHash || mapping?.documentHash || '',
+          fromBackfillOnly: book.lastEvent === 'backfill',
           mapping
         });
       }
@@ -2708,6 +2765,14 @@
           if (latestDate && (!row.lastDate || (latestDate > row.lastDate && hasActiveReading))) {
             row.lastDate = latestDate;
           }
+        }
+        if (
+          row.mapping &&
+          row.mapping.status === 'read' &&
+          row.mapping.lastSyncedPercent === 100 &&
+          (row.devicePercent === null || row.fromBackfillOnly)
+        ) {
+          row.devicePercent = 100;
         }
       }
 
@@ -2790,6 +2855,16 @@
     async function syncBookCore(row, opts = {}) {
       const mapping = row.mapping;
       if (!mapping || !mapping.bookId) return { outcome: 'skipped', summary: 'Unlinked' };
+      const unsyncedAtStart = getUnsyncedJournalDays(historyData, row);
+      for (const d of unsyncedAtStart) {
+        if (
+          d.endPercent !== null &&
+          d.endPercent !== undefined &&
+          (row.devicePercent === null || row.devicePercent === undefined || d.endPercent > row.devicePercent)
+        ) {
+          row.devicePercent = d.endPercent;
+        }
+      }
       if (row.devicePercent === null) {
         return { outcome: 'skipped', summary: 'No device reading event' };
       }
@@ -2841,6 +2916,17 @@
 
       if (pageInfo.status === 'read') {
         if (row.devicePercent === 100) {
+          if (unsyncedAtStart.length > 0) {
+            let histMarked = false;
+            for (const d of unsyncedAtStart) {
+              if (markHistoryDaySynced(historyData, row, d.date)) histMarked = true;
+            }
+            if (histMarked) {
+              try {
+                await saveHistoryData();
+              } catch (_) {}
+            }
+          }
           mapping.status = 'read';
           mapping.lastSyncedPercent = 100;
           mapping.lastSyncedAt = new Date().toISOString();
@@ -3210,7 +3296,7 @@
             historyData = preHist.history;
             await saveHistoryData();
           }
-          await writePluginText(EVENTS_FILE, compactEventsJsonl(outboxRaw));
+          await writePluginText(EVENTS_FILE, compactEventsJsonl(outboxRaw, historyData));
           await loadLocalState();
           renderAll();
           compactedNote = `, compacted outbox (${outboxBytes}/${OUTBOX_LIMIT_BYTES} B)`;
@@ -3402,7 +3488,7 @@
           historyData = preHist.history;
           await saveHistoryData();
         }
-        const compacted = compactEventsJsonl(outboxRaw);
+        const compacted = compactEventsJsonl(outboxRaw, historyData);
         await writePluginText(EVENTS_FILE, compacted);
         await loadLocalState();
         renderAll();

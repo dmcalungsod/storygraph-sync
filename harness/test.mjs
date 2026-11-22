@@ -396,6 +396,32 @@ async function runTests() {
   const vol10Compacted = sg.compactEventsJsonl(vol10TrailingZeroJsonl);
   assert.equal(sg.reduceEventsJsonl(vol10Compacted).get(vol10Path).percent, 100);
 
+  // Invariant 1 & 2: Non-zero exit decrease ignored, moved paths coalesced in reduceEventsJsonl, and history-aware compaction
+  const nonZeroDropJsonl = [
+    JSON.stringify({ e: 'reader.session', id: 'inv1-1', ts: 1795308100, vars: { book: '/Books/Sub/Alpha.epub', document: 'doc-alpha-1', end_progress_bp: '10000', progress_scale: '10000', duration_seconds: '500' } }),
+    JSON.stringify({ e: 'reader.exit', id: 'inv1-2', ts: 1795308110, vars: { book: '/Books/Sub/Alpha.epub', percent: '95' } }),
+    JSON.stringify({ e: 'reader.exit', id: 'inv1-3', ts: 1795308120, vars: { book: '/Read/Alpha.epub', document: 'doc-alpha-1', percent: '2' } })
+  ].join('\n');
+  const inv1Map = sg.reduceEventsJsonl(nonZeroDropJsonl);
+  assert.equal(inv1Map.size, 1, 'Moved book events in events.jsonl must coalesce into 1 entry');
+  assert.equal(inv1Map.get('/Read/Alpha.epub')?.percent, 100, 'Non-zero exit decrease must not downgrade 100% finished progress');
+  assert.equal(inv1Map.get('/Read/Alpha.epub')?.finished, true);
+  assert.equal(inv1Map.get('/Read/Alpha.epub')?.durationSeconds, 500);
+
+  const lowOutbox = JSON.stringify({ e: 'reader.exit', id: 'inv2-1', ts: 1795308200, vars: { book: '/Books/Sub/Beta.epub', percent: '10' } });
+  const higherHist = {
+    version: 1,
+    books: {
+      '/Books/Sub/Beta.epub': {
+        days: {
+          '2026-11-22': { date: '2026-11-22', startPercent: 10, endPercent: 100, durationSeconds: 900, sessions: 1, syncedToJournal: false, seenIds: [] }
+        }
+      }
+    }
+  };
+  const inv2Compacted = sg.compactEventsJsonl(lowOutbox, higherHist);
+  assert.equal(sg.reduceEventsJsonl(inv2Compacted).get('/Books/Sub/Beta.epub')?.percent, 100, 'compactEventsJsonl must preserve 100% from reading-history.json');
+
   const zeroReadEvents = sg.reduceEventsJsonl([
     sampleJsonl,
     '{"e":"reader.exit","id":"bc-z1","ts":1795225600,"vars":{"book":"/Read/Mystery Example - Author Delta.epub","percent":"0"}}'
@@ -2492,6 +2518,33 @@ async function runTests() {
     );
     await refreshBtn.trigger('click');
     assert.ok(booksListEl.textContent.includes('100% — Ready'), 'Expected 100% rolled up from reading-history.json despite 0% in events.jsonl');
+
+    // Invariant 4 & 5: Clicking standalone Sync Journal on a 100% book delegates to syncBookCore (marks Read directly and never leaves book in Currently Reading)
+    afterImpHist.books[mtPath].days['2026-11-22'].syncedToJournal = false;
+    await mockApi.writeFile(
+      '/.crosspoint/plugins/storygraph-sync/reading-history.json',
+      Buffer.from(JSON.stringify(afterImpHist), 'utf8').toString('base64')
+    );
+    await refreshBtn.trigger('click');
+    sgState.posts.length = 0;
+    const mtSyncJournalBtn = booksListEl
+      .querySelectorAll('button')
+      .find((b) => b.getAttribute('data-act') === 'sync-journal' && b.getAttribute('data-key') === mtPath);
+    assert.ok(mtSyncJournalBtn, 'Expected Sync Journal button on 100% book with unsynced 100% day');
+    await booksListEl.trigger('click', { target: mtSyncJournalBtn });
+    await waitForLong(
+      () => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled && sgState.books['book-mt-9'].statusLabel === 'read',
+      'Expected standalone Sync Journal on 100% book to mark book Read on StoryGraph'
+    );
+    assert.equal(
+      sgState.posts.filter((p) => p.bid === 'book-mt-9' && p.path === '/update-progress-with-note' && p.val === 100).length,
+      0,
+      'Standalone Sync Journal must not post 100% progress-with-note before status=read'
+    );
+    assert.ok(
+      sgState.posts.some((p) => p.bid === 'book-mt-9' && p.path === '/update-status.js' && p.st === 'read'),
+      'Standalone Sync Journal on 100% book must transition status to read'
+    );
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
