@@ -272,11 +272,26 @@ function buildMockStoryGraphHtml(urlStr, csrfToken, state) {
     const b = state.books[id] || { title: 'Mock Book', pages: 320, journalEntries: [] };
     const panes = (b.journalEntries || [])
       .map((entry, idx) => {
+        const eid = entry.entryId || `je-${idx + 1}`;
         const dStr = formatMockJournalDate(entry.date);
-        const body = entry.isStatus
-          ? '<span>Started reading</span>'
-          : `<div class="inline">${entry.percent ?? 0}%</div><p class="clear-both">${entry.pages ?? 0} pages read <span class="font-normal">(${entry.pages ?? 0} pages out of ${b.pages || 0})</span></p>`;
-        return `<div class="mb-3 grid grid-cols-4 md:grid-cols-6"><div class="col-span-4 md:col-span-4 ml-2 md:ml-2"><div class="mb-4"><p class="font-semibold text-xs md:text-sm">${dStr} <a href="/journal_entries/je-${idx + 1}/edit">Edit</a></p></div><div class="mt-2 mb-4">${body}</div></div></div>`;
+        const noteHtml = entry.note
+          ? `<div class="clear-both trix-content text-xs md:text-sm"><div class="trix-content">${entry.note}</div></div>`
+          : '';
+        let body = '';
+        if (entry.statusKind === 'finished') {
+          const delta = entry.pagesDelta ?? 0;
+          const tot = entry.totalPages ?? b.pages ?? 0;
+          const pgs = entry.pages ?? tot;
+          body = `<span>Finished</span><p class="mt-2 clear-both">${delta} pages read <span class="font-normal">(${pgs} pages out of ${tot})</span></p>${noteHtml}`;
+        } else if (entry.isStatus || entry.statusKind === 'started') {
+          body = '<span>Started reading</span>';
+        } else {
+          const tot = entry.totalPages ?? b.pages ?? 0;
+          const pgs = entry.pages ?? 0;
+          const delta = entry.pagesDelta ?? pgs;
+          body = `<div class="inline">${entry.percent ?? 0}%</div><p class="clear-both">${delta} pages read <span class="font-normal">(${pgs} pages out of ${tot})</span></p>${noteHtml}`;
+        }
+        return `<div class="mb-3 grid grid-cols-4 md:grid-cols-6"><div class="col-span-4 md:col-span-4 ml-2 md:ml-2"><div class="mb-4"><p class="font-semibold text-xs md:text-sm">${dStr} <a href="/journal_entries/${eid}/edit">Edit</a></p></div><div class="mt-2 mb-4">${body}</div></div></div>`;
       })
       .join('\n');
     return `<!DOCTYPE html><html><head><title>${b.title} Journal | The StoryGraph</title><meta name="csrf-token" content="${csrfToken}"></head><body><h3>${b.title}</h3><span class="journal-entry-panes">${panes}</span></body></html>`;
@@ -774,6 +789,55 @@ export function createMockServer({ live = false } = {}) {
           'X-Relay-Status': '302',
           'X-Relay-Headers': JSON.stringify([
             ['location', `https://app.thestorygraph.com/books/${bid}`],
+            ['set-cookie', '_storygraph_session=rotated_sess_999; path=/; HttpOnly']
+          ])
+        });
+        res.end('');
+        return;
+      } else if (target.pathname.startsWith('/journal_entries/')) {
+        const entryId = target.pathname.split('/')[2] || '';
+        const method = (params.get('_method') || 'post').toLowerCase();
+        for (const [bid, b] of Object.entries(sgState.books)) {
+          const list = b.journalEntries || [];
+          const idx = list.findIndex((e, i) => (e.entryId || `je-${i + 1}`) === entryId);
+          if (idx !== -1) {
+            if (method === 'delete') {
+              list.splice(idx, 1);
+            } else if (method === 'put') {
+              const date = buildMockDateFromParts(
+                params.get('journal_entry[year]'),
+                params.get('journal_entry[month]'),
+                params.get('journal_entry[day]')
+              );
+              if (date) list[idx].date = date;
+              if (params.has('journal_entry[pages_read]')) {
+                list[idx].pagesDelta = Number(params.get('journal_entry[pages_read]') || 0);
+              }
+              if (params.has('journal_entry[pages_read_total]')) {
+                list[idx].pages = Number(params.get('journal_entry[pages_read_total]') || 0);
+              }
+              if (params.has('journal_entry[percent_reached]')) {
+                list[idx].percent = Number(params.get('journal_entry[percent_reached]') || 0);
+              }
+              if (params.has('journal_entry[note]')) {
+                list[idx].note = params.get('journal_entry[note]') || '';
+              }
+            }
+            sgState.posts.push({
+              path: target.pathname,
+              method,
+              bid,
+              entryId,
+              pagesRead: params.has('journal_entry[pages_read]') ? Number(params.get('journal_entry[pages_read]')) : null,
+              acceptEncoding
+            });
+            break;
+          }
+        }
+        res.writeHead(200, {
+          'X-Relay-Status': '302',
+          'X-Relay-Headers': JSON.stringify([
+            ['location', 'https://app.thestorygraph.com/journal'],
             ['set-cookie', '_storygraph_session=rotated_sess_999; path=/; HttpOnly']
           ])
         });

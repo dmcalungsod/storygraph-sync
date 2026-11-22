@@ -589,19 +589,199 @@
       if (!block || seenBlocks.has(block)) continue;
       seenBlocks.add(block);
 
+      const href = link.getAttribute('href') || '';
+      const idMatch = href.match(/\/journal_entries\/([^/?#"]+)\/edit/i);
+      const entryId = idMatch ? idMatch[1] : null;
+
       const text = extractNodeSpacedText(block).replace(/\s+/g, ' ').trim();
       const date = parseStoryGraphJournalDate(text);
       if (!date) continue;
 
       const pctMatch = text.match(/\b(\d{1,3})%/);
-      const percent = pctMatch ? Number(pctMatch[1]) : null;
-      const pagesMatch = text.match(/\((\d+)\s+pages?\s+out\s+of\s+\d+\)/i);
+      const rawPercent = pctMatch ? Number(pctMatch[1]) : null;
+      const pagesMatch = text.match(/\((\d+)\s+pages?\s+out\s+of\s+(\d+)\)/i);
       const pages = pagesMatch ? Number(pagesMatch[1]) : null;
-      const isStatus = /\b(started reading|finished)\b/i.test(text) && percent === null && pages === null;
-      entries.push({ date, isStatus, percent, pages });
+      const totalPages = pagesMatch ? Number(pagesMatch[2]) : null;
+      const deltaMatch = text.match(/\b(\d+)\s+pages?\s+read\b/i);
+      const pagesDelta = deltaMatch ? Number(deltaMatch[1]) : null;
+
+      let statusKind = null;
+      if (
+        /\bEdit\s+Started reading\b/i.test(text) ||
+        (rawPercent === null && pages === null && /\bStarted reading\b/i.test(text))
+      ) {
+        statusKind = 'started';
+      } else if (
+        /\bEdit\s+Finished\b/i.test(text) ||
+        (rawPercent === null && /\bFinished\b/i.test(text))
+      ) {
+        statusKind = 'finished';
+      } else if (/\bEdit\s+(Paused|Resumed|Did not finish)\b/i.test(text)) {
+        statusKind = 'other-status';
+      }
+      const isStatus = Boolean(statusKind);
+      const percent = rawPercent !== null ? rawPercent : statusKind === 'finished' ? 100 : null;
+
+      let note = '';
+      const trixEls = block.querySelectorAll('.trix-content');
+      if (trixEls && trixEls.length > 0) {
+        const lastTrix = trixEls[trixEls.length - 1];
+        note = extractNodeSpacedText(lastTrix).replace(/\s+/g, ' ').trim();
+      }
+
+      entries.push({
+        entryId,
+        date,
+        statusKind,
+        isStatus,
+        percent,
+        pages,
+        pagesDelta,
+        totalPages,
+        note
+      });
     }
 
     return Object.assign({}, guards, { entries });
+  }
+
+  function buildJournalEntryUpdateBody({
+    csrf,
+    date,
+    pagesRead,
+    pagesReadTotal,
+    percentReached,
+    note,
+    returnTo
+  }) {
+    const parts = parseIsoDateParts(date);
+    const params = new URLSearchParams();
+    params.set('_method', 'put');
+    params.set('authenticity_token', String(csrf || ''));
+    params.set('journal_entry[day]', parts ? String(parts.day) : '');
+    params.set('journal_entry[month]', parts ? String(parts.month) : '');
+    params.set('journal_entry[year]', parts ? String(parts.year) : '');
+    params.set('journal_entry[pages_read]', String(pagesRead ?? 0));
+    params.set('journal_entry[pages_read_total]', String(pagesReadTotal ?? 0));
+    params.set('journal_entry[percent_reached]', String(percentReached ?? 100));
+    params.set('journal_entry[note]', String(note || ''));
+    params.set('return_to', String(returnTo || ''));
+    return params.toString();
+  }
+
+  function buildJournalEntryDeleteBody(csrf) {
+    const params = new URLSearchParams();
+    params.set('_method', 'delete');
+    params.set('authenticity_token', String(csrf || ''));
+    return params.toString();
+  }
+
+  function planJournalCleanup(entries) {
+    const list = Array.isArray(entries) ? entries.filter((e) => e && e.entryId && e.date) : [];
+    const updates = [];
+    const deletes = [];
+    const toDeleteIds = new Set();
+
+    const markDelete = (entry, reason) => {
+      if (!entry || !entry.entryId || toDeleteIds.has(entry.entryId)) return;
+      toDeleteIds.add(entry.entryId);
+      deletes.push({
+        entryId: entry.entryId,
+        date: entry.date,
+        percent: entry.percent,
+        pages: entry.pages,
+        pagesDelta: entry.pagesDelta,
+        reason
+      });
+    };
+
+    // Rule 1: Bogus 0% progress entries (!isStatus with 0% and 0 pages)
+    for (const e of list) {
+      if (
+        !e.isStatus &&
+        e.percent === 0 &&
+        (e.pages === 0 || e.pages === null) &&
+        (e.pagesDelta === 0 || e.pagesDelta === null)
+      ) {
+        markDelete(e, '0% progress entry');
+      }
+    }
+
+    // Rule 2: Stray 100% progress entries alongside a Finished status entry
+    const finishedEntries = list.filter((e) => e.statusKind === 'finished');
+    const hundredProgressEntries = list.filter(
+      (e) =>
+        !e.isStatus &&
+        !toDeleteIds.has(e.entryId) &&
+        (e.percent === 100 || (e.totalPages && e.pages === e.totalPages))
+    );
+    if (finishedEntries.length > 0 && hundredProgressEntries.length > 0) {
+      const fin = finishedEntries[finishedEntries.length - 1];
+      const strayWithPages = hundredProgressEntries.find((e) => (e.pagesDelta || 0) > 0);
+      if ((fin.pagesDelta === 0 || fin.pagesDelta === null) && strayWithPages) {
+        const totalPgs =
+          fin.totalPages ||
+          strayWithPages.totalPages ||
+          fin.pages ||
+          strayWithPages.pages ||
+          strayWithPages.pagesDelta;
+        updates.push({
+          entryId: fin.entryId,
+          date: fin.date,
+          pagesRead: strayWithPages.pagesDelta,
+          pagesReadTotal: totalPgs,
+          percentReached: 100,
+          note: fin.note || strayWithPages.note || '',
+          reason: 'transfer page credit to Finished entry'
+        });
+      }
+      for (const h of hundredProgressEntries) {
+        markDelete(h, 'duplicate 100% progress entry alongside Finished');
+      }
+    }
+
+    // Rule 3: Same-day intermediate progress entry when Finished on that date already credits full book pages
+    for (const fin of finishedEntries) {
+      const fullPages = fin.totalPages || fin.pages || 0;
+      if (fullPages > 0 && fin.pagesDelta !== null && fin.pagesDelta >= fullPages) {
+        for (const e of list) {
+          if (
+            !e.isStatus &&
+            !toDeleteIds.has(e.entryId) &&
+            e.date === fin.date &&
+            (e.pagesDelta || 0) > 0
+          ) {
+            markDelete(e, 'same-day progress already credited in Finished entry');
+          }
+        }
+      }
+    }
+
+    // Rule 4: Exact same-day duplicate progress entries (same date, percent, and pages)
+    const groups = new Map();
+    for (const e of list) {
+      if (e.isStatus || toDeleteIds.has(e.entryId)) continue;
+      const key = `${e.date}|${e.percent ?? ''}|${e.pages ?? ''}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(e);
+    }
+    for (const group of groups.values()) {
+      if (group.length <= 1) continue;
+      let keepIdx = group.length - 1;
+      for (let i = group.length - 1; i >= 0; i--) {
+        if (group[i].note) {
+          keepIdx = i;
+          break;
+        }
+      }
+      for (let i = 0; i < group.length; i++) {
+        if (i !== keepIdx) {
+          markDelete(group[i], 'duplicate same-day progress entry');
+        }
+      }
+    }
+
+    return { updates, deletes };
   }
 
   function buildDatedProgressFormBody({
@@ -1265,7 +1445,9 @@
 
   function isJournalDayAlreadyOnStoryGraph(journalEntries, dateIso, targetVal, usePages) {
     return (journalEntries || []).some((e) => {
-      if (!e || e.isStatus || e.date !== dateIso) return false;
+      if (!e || e.date !== dateIso) return false;
+      if (e.statusKind === 'finished') return true;
+      if (e.isStatus) return false;
       if (usePages && e.pages !== null && e.pages !== undefined) {
         return e.pages >= targetVal;
       }
@@ -1896,6 +2078,9 @@
       localIsoDateFromTs,
       parseStoryGraphJournalDate,
       parseStoryGraphJournalPage,
+      buildJournalEntryUpdateBody,
+      buildJournalEntryDeleteBody,
+      planJournalCleanup,
       buildDatedProgressFormBody,
       mergeEventsIntoHistory,
       parseSessionHistoryText,
@@ -2309,6 +2494,79 @@
       return { updated: false, skippedReason: 'unsupported-status', pageInfo: info };
     }
 
+    async function executeJournalCleanupPlan(bookId, journalParsed, fallbackCsrf, journalUrl) {
+      const plan = planJournalCleanup(journalParsed && journalParsed.entries);
+      if (plan.updates.length === 0 && plan.deletes.length === 0) {
+        return { updated: 0, deleted: 0, entries: (journalParsed && journalParsed.entries) || [] };
+      }
+      const csrf = (journalParsed && journalParsed.csrf) || fallbackCsrf;
+      if (!csrf) {
+        throw new Error('Could not find fresh CSRF token on journal page.');
+      }
+      const returnTo = `/journal?book_id=${encodeURIComponent(bookId)}`;
+      let updated = 0;
+      let deleted = 0;
+
+      for (const u of plan.updates) {
+        await sleepMs(150);
+        const body = buildJournalEntryUpdateBody({
+          csrf,
+          date: u.date,
+          pagesRead: u.pagesRead,
+          pagesReadTotal: u.pagesReadTotal,
+          percentReached: u.percentReached,
+          note: u.note,
+          returnTo
+        });
+        const entryUrl = `${BASE_URL}/journal_entries/${encodeURIComponent(u.entryId)}`;
+        try {
+          await postStoryGraphForm(entryUrl, body, journalUrl, csrf, {
+            accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+          });
+          updated++;
+        } catch (err) {
+          if (isRelay502Error(err)) {
+            updated++;
+          } else {
+            throw new Error('Journal entry update failed: ' + (err && err.message ? err.message : err));
+          }
+        }
+      }
+
+      for (const d of plan.deletes) {
+        await sleepMs(150);
+        const body = buildJournalEntryDeleteBody(csrf);
+        const entryUrl = `${BASE_URL}/journal_entries/${encodeURIComponent(d.entryId)}`;
+        try {
+          await postStoryGraphForm(entryUrl, body, journalUrl, csrf, {
+            accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+          });
+          deleted++;
+        } catch (err) {
+          if (isRelay502Error(err)) {
+            deleted++;
+          } else {
+            throw new Error('Journal entry delete failed: ' + (err && err.message ? err.message : err));
+          }
+        }
+      }
+
+      const deletedSet = new Set(plan.deletes.map((d) => d.entryId));
+      const remaining = ((journalParsed && journalParsed.entries) || []).filter(
+        (e) => !e || !e.entryId || !deletedSet.has(e.entryId)
+      );
+      return { updated, deleted, entries: remaining };
+    }
+
+    async function cleanBookJournalCore(row) {
+      const mapping = row && row.mapping;
+      if (!mapping || !mapping.bookId) return { updated: 0, deleted: 0 };
+      const journalUrl = `${BASE_URL}/journal?book_id=${encodeURIComponent(mapping.bookId)}`;
+      const journalHtml = await fetchStoryGraphHtml(journalUrl);
+      const journalParsed = parseStoryGraphJournalPage(journalHtml);
+      return executeJournalCleanupPlan(mapping.bookId, journalParsed, journalParsed.csrf, journalUrl);
+    }
+
     async function syncBookJournalCore(row, pageInfo, activeBookUrl, opts = {}) {
       const unsynced = getUnsyncedJournalDays(historyData, row);
       if (unsynced.length === 0) {
@@ -2317,6 +2575,15 @@
       const journalUrl = `${BASE_URL}/journal?book_id=${encodeURIComponent(pageInfo.bookId)}`;
       const journalHtml = await fetchStoryGraphHtml(journalUrl);
       let journalParsed = parseStoryGraphJournalPage(journalHtml);
+      const cleanRes = await executeJournalCleanupPlan(
+        pageInfo.bookId,
+        journalParsed,
+        pageInfo.csrf,
+        journalUrl
+      );
+      if (cleanRes.deleted > 0 || cleanRes.updated > 0) {
+        journalParsed.entries = cleanRes.entries;
+      }
       const usePages = pageInfo.progressType === 'pages' && pageInfo.bookNumOfPages > 0;
       let lastPages = pageInfo.lastReachedPages || 0;
       let lastPct = pageInfo.lastReachedPercent || 0;
@@ -3398,6 +3665,71 @@
       });
     }
 
+    async function cleanAllJournals() {
+      const linkedRows = buildBookRows().filter((r) => r && r.mapping && r.mapping.bookId);
+      if (linkedRows.length === 0) {
+        setBanner('Link at least one book to StoryGraph first.', 'muted');
+        return;
+      }
+
+      const total = linkedRows.length;
+      await runExclusive(`Scanning & cleaning journals (${total} book(s))...`, async () => {
+        let booksCleaned = 0;
+        let totalDeleted = 0;
+        let totalUpdated = 0;
+        let failed = 0;
+        let lastError = '';
+
+        setSyncProgress(0, `Cleaning Journals (0/${total})...`);
+
+        for (let i = 0; i < total; i++) {
+          const row = linkedRows[i];
+          if (i > 0) {
+            await sleepMs(300);
+          }
+          const pct = Math.round(((i + 0.3) / total) * 100);
+          setSyncProgress(pct, `Scanning journal ${i + 1} of ${total} (${pct}%) — "${row.title}"...`);
+          setBanner(`Scanning journal ${i + 1}/${total}: "${row.title}"...`, 'muted');
+          try {
+            const res = await cleanBookJournalCore(row);
+            if (res.deleted > 0 || res.updated > 0) {
+              booksCleaned++;
+              totalDeleted += res.deleted;
+              totalUpdated += res.updated;
+            }
+            const donePct = Math.round(((i + 1) / total) * 100);
+            const actLabel =
+              res.deleted > 0 || res.updated > 0
+                ? `Cleaned (${res.deleted} deleted${res.updated ? ', ' + res.updated + ' repaired' : ''})`
+                : 'Clean';
+            setSyncProgress(donePct, `${actLabel} ${i + 1} of ${total} (${donePct}%) — "${row.title}"`);
+          } catch (err) {
+            failed++;
+            lastError = String(err && err.message ? err.message : err);
+            const lower = lastError.toLowerCase();
+            if (lower.includes('expired') || lower.includes('cloudflare') || lower.includes('blocked')) {
+              break;
+            }
+          }
+        }
+
+        if (failed > 0) {
+          setBanner(
+            `Journal cleanup finished: ${totalDeleted} deleted, ${totalUpdated} repaired across ${booksCleaned} book(s), ${failed} failed (${lastError}).`,
+            'err'
+          );
+        } else if (totalDeleted === 0 && totalUpdated === 0) {
+          setSyncProgress(100, `100% — All ${total} linked book journal(s) are already clean`);
+          setBanner(`All ${total} linked book journal(s) are already clean.`, 'muted');
+        } else {
+          const repairNote = totalUpdated > 0 ? `, ${totalUpdated} Finished page credit(s) repaired` : '';
+          const msg = `Journal cleanup complete: ${totalDeleted} redundant/0% entry(s) deleted${repairNote} across ${booksCleaned} book(s).`;
+          setSyncProgress(100, `100% — ${msg}`);
+          setBanner(msg, 'ok');
+        }
+      });
+    }
+
     async function markBookRead(row) {
       const mapping = row.mapping;
       if (!mapping || !mapping.bookId) return;
@@ -4279,6 +4611,7 @@
           '<div class="sg-row">' +
             '<button type="button" class="sg-btn sg-btn-primary" id="sg-sync-all" title="Sequentially sync all linked books with unsynced progress" disabled>Sync All</button>' +
             '<button type="button" class="sg-btn" id="sg-sync-dates" title="Push device start &amp; finish dates to StoryGraph for linked books" disabled>Sync Dates</button>' +
+            '<button type="button" class="sg-btn" id="sg-clean-journals" title="Scan linked StoryGraph Reading Journals and remove bogus 0% or duplicate 100% entries">Clean Journals</button>' +
             '<button type="button" class="sg-btn" id="sg-refresh">Refresh</button>' +
             '<button type="button" class="sg-btn" id="sg-compact" title="Shrink events.jsonl down to 1 latest snapshot per book (keeps outbox under 4 KB)">Compact Outbox</button>' +
           '</div>' +
@@ -4390,6 +4723,7 @@
     container.querySelector('#sg-history-import-cancel').addEventListener('click', () => toggleSessionHistoryImportBox(false));
     container.querySelector('#sg-sync-all').addEventListener('click', syncAllPending);
     container.querySelector('#sg-sync-dates').addEventListener('click', syncAllDates);
+    container.querySelector('#sg-clean-journals').addEventListener('click', cleanAllJournals);
     container.querySelector('#sg-compact').addEventListener('click', compactOutbox);
     container.querySelector('#sg-filter-tabs').addEventListener('click', (e) => {
       const btn = e && e.target ? e.target.closest('button[data-filter]') : null;

@@ -2545,6 +2545,76 @@ async function runTests() {
       sgState.posts.some((p) => p.bid === 'book-mt-9' && p.path === '/update-status.js' && p.st === 'read'),
       'Standalone Sync Journal on 100% book must transition status to read'
     );
+
+    // Case 10: Automated Reading Journal cleanup (parseStoryGraphJournalPage + planJournalCleanup + #sg-clean-journals)
+    const sampleCleanupJournalHtml = `<!DOCTYPE html><html><head><title>Journal</title><meta name="csrf-token" content="tok-clean"></head><body>
+      <span class="journal-entry-panes">
+        <div class="mb-3"><p>31 October 2026 <a href="/journal_entries/je-start/edit">Edit</a></p><span>Started reading</span></div>
+        <div class="mb-3"><p>2 November 2026 <a href="/journal_entries/je-fin/edit">Edit</a></p><span>Finished</span><p>0 pages read <span class="font-normal">(203 pages out of 203)</span></p></div>
+        <div class="mb-3"><p>21 November 2026 <a href="/journal_entries/je-stray-100/edit">Edit</a></p><div>100%</div><p>203 pages read <span class="font-normal">(203 pages out of 203)</span></p></div>
+        <div class="mb-3"><p>22 November 2026 <a href="/journal_entries/je-zero/edit">Edit</a></p><div>0%</div><p>0 pages read <span class="font-normal">(0 pages out of 203)</span></p></div>
+      </span>
+    </body></html>`;
+    const parsedCleanupJournal = sg.parseStoryGraphJournalPage(sampleCleanupJournalHtml);
+    assert.equal(parsedCleanupJournal.csrf, 'tok-clean');
+    assert.equal(parsedCleanupJournal.entries.length, 4);
+    assert.equal(parsedCleanupJournal.entries[0].entryId, 'je-start');
+    assert.equal(parsedCleanupJournal.entries[0].statusKind, 'started');
+    assert.equal(parsedCleanupJournal.entries[0].isStatus, true);
+    assert.equal(parsedCleanupJournal.entries[1].entryId, 'je-fin');
+    assert.equal(parsedCleanupJournal.entries[1].statusKind, 'finished');
+    assert.equal(parsedCleanupJournal.entries[1].isStatus, true);
+    assert.equal(parsedCleanupJournal.entries[1].pagesDelta, 0);
+    assert.equal(parsedCleanupJournal.entries[1].totalPages, 203);
+    assert.equal(parsedCleanupJournal.entries[2].entryId, 'je-stray-100');
+    assert.equal(parsedCleanupJournal.entries[2].isStatus, false);
+    assert.equal(parsedCleanupJournal.entries[2].percent, 100);
+    assert.equal(parsedCleanupJournal.entries[2].pagesDelta, 203);
+    assert.equal(parsedCleanupJournal.entries[3].entryId, 'je-zero');
+    assert.equal(parsedCleanupJournal.entries[3].percent, 0);
+
+    const cleanupPlanA = sg.planJournalCleanup(parsedCleanupJournal.entries);
+    assert.equal(cleanupPlanA.updates.length, 1, 'Expected 1 update transferring page credit to Finished entry');
+    assert.equal(cleanupPlanA.updates[0].entryId, 'je-fin');
+    assert.equal(cleanupPlanA.updates[0].pagesRead, 203);
+    assert.equal(cleanupPlanA.updates[0].pagesReadTotal, 203);
+    assert.deepEqual(
+      Array.from(cleanupPlanA.deletes, (d) => d.entryId),
+      ['je-zero', 'je-stray-100'],
+      'Expected bogus 0% and stray 100% entries marked for deletion'
+    );
+
+    // Same-day intermediate entry alongside Finished that already credits full book pages
+    const cleanupPlanB = sg.planJournalCleanup([
+      { entryId: 'je-s', date: '2026-11-19', statusKind: 'started', isStatus: true, percent: null, pages: null, pagesDelta: null, totalPages: null },
+      { entryId: 'je-81', date: '2026-11-21', statusKind: null, isStatus: false, percent: 81, pages: 254, pagesDelta: 254, totalPages: 314 },
+      { entryId: 'je-f', date: '2026-11-21', statusKind: 'finished', isStatus: true, percent: 100, pages: 314, pagesDelta: 314, totalPages: 314 }
+    ]);
+    assert.equal(cleanupPlanB.updates.length, 0);
+    assert.deepEqual(Array.from(cleanupPlanB.deletes, (d) => d.entryId), ['je-81']);
+
+    // UI button #sg-clean-journals end-to-end execution
+    const cleanJournalsBtn = mockContainer.querySelector('#sg-clean-journals');
+    assert.ok(cleanJournalsBtn, '#sg-clean-journals button must render');
+    sgState.books['book-mt-9'].journalEntries = [
+      { entryId: 'je-mt-start', date: '2026-11-01', statusKind: 'started', isStatus: true },
+      { entryId: 'je-mt-fin', date: '2026-11-05', statusKind: 'finished', isStatus: true, pagesDelta: 0, pages: 320, totalPages: 320 },
+      { entryId: 'je-mt-stray100', date: '2026-11-21', statusKind: null, isStatus: false, percent: 100, pagesDelta: 320, pages: 320, totalPages: 320 },
+      { entryId: 'je-mt-zero', date: '2026-11-22', statusKind: null, isStatus: false, percent: 0, pagesDelta: 0, pages: 0, totalPages: 320 }
+    ];
+    sgState.posts.length = 0;
+    await cleanJournalsBtn.trigger('click');
+    await waitForLong(
+      () => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled && bannerEl.textContent.includes('Journal cleanup complete'),
+      'Expected #sg-clean-journals batch cleanup to complete'
+    );
+    assert.ok(
+      bannerEl.textContent.includes('2 redundant/0% entry(s) deleted') &&
+        bannerEl.textContent.includes('1 Finished page credit(s) repaired'),
+      `Expected cleanup summary banner, got "${bannerEl.textContent}"`
+    );
+    assert.equal(sgState.books['book-mt-9'].journalEntries.length, 2, 'Only Started and Finished entries should remain');
+    assert.equal(sgState.books['book-mt-9'].journalEntries[1].pagesDelta, 320, 'Finished entry should receive 320 pages credit');
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
