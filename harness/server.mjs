@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PLUGIN_DIR = path.resolve(__dirname, '..', 'plugin');
+const PLUGIN_DIR = path.resolve(__dirname, '..', 'storygraph-sync.crosspoint-plugin');
 const VIRTUAL_DIR = '/.crosspoint/plugins/storygraph-sync';
 const RELAY_MAX_BODY_BYTES = 32768;
 const MAX_HEADER_COUNT = 16;

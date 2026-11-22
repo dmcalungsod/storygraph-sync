@@ -1,4 +1,4 @@
-// StoryGraph Sync — CrossInk Browser Plugin (v0.1.0)
+// StoryGraph Sync — CrossPoint / CrossInk Browser Plugin (v1.0.0)
 // Subscribes to reader.exit / reader.session via device.json -> events.jsonl,
 // fetches StoryGraph HTML via api.fetchToSd(), and submits form updates via api.relay().
 (function () {
@@ -10,6 +10,8 @@
   const LS_AUTO_COMPACT_KEY = 'sgSync.autoCompact';
   const LS_OVERWRITE_LOWER_KEY = 'sgSync.overwriteLower';
   const LS_JOURNAL_NOTES_KEY = 'sgSync.journalNotes';
+  const LS_DEVICE_LABEL_KEY = 'sgSync.deviceLabel';
+  const DEFAULT_DEVICE_LABEL = 'CrossPoint';
   const MAP_FILE = 'storygraph-map.json';
   const HISTORY_FILE = 'reading-history.json';
   const EVENTS_FILE = 'events.jsonl';
@@ -966,18 +968,19 @@
     return startClock || endClock;
   }
 
-  function formatSessionJournalNote(session, includeDurationNotes) {
+  function formatSessionJournalNote(session, includeDurationNotes, deviceLabel) {
     if (!includeDurationNotes || !session) return '';
+    const label = String(deviceLabel || '').trim() || DEFAULT_DEVICE_LABEL;
     const durStr = formatDurationLabel(session.durationSeconds);
     const rangeStr = formatSessionTimeRangeLabel(session);
     if (rangeStr && durStr) {
-      return `${rangeStr} · ${durStr} read on X4 Pro`;
+      return `${rangeStr} · ${durStr} read on ${label}`;
     }
     if (durStr) {
-      return `${durStr} read on X4 Pro`;
+      return `${durStr} read on ${label}`;
     }
     if (rangeStr) {
-      return `${rangeStr} · read on X4 Pro`;
+      return `${rangeStr} · read on ${label}`;
     }
     return '';
   }
@@ -2926,6 +2929,7 @@
     let autoCompact = lsGet(LS_AUTO_COMPACT_KEY, '1') !== '0';
     let overwriteLowerInBatch = lsGet(LS_OVERWRITE_LOWER_KEY, '0') === '1';
     let includeJournalNotes = lsGet(LS_JOURNAL_NOTES_KEY, '1') !== '0';
+    let deviceLabel = lsGet(LS_DEVICE_LABEL_KEY, DEFAULT_DEVICE_LABEL);
     let mapData = { version: 1, books: {} };
     let historyData = { version: 1, books: {} };
     let outboxBytes = 0;
@@ -3511,7 +3515,7 @@
         }
 
         const targetVal = computeSessionTargetVal(session);
-        const note = formatSessionJournalNote(session, includeJournalNotes);
+        const note = formatSessionJournalNote(session, includeJournalNotes, deviceLabel);
 
         // 1. Reconcile an interrupted 'in_flight' session (Issue B)
         if (session.syncStatus === 'in_flight') {
@@ -4937,7 +4941,8 @@
       const payload = JSON.stringify(
         {
           cookieHeader: lsGet(LS_COOKIE_KEY, ''),
-          userAgent: userAgent || ''
+          userAgent: userAgent || '',
+          deviceLabel: deviceLabel || DEFAULT_DEVICE_LABEL
         },
         null,
         2
@@ -4965,6 +4970,10 @@
         if (typeof parsed.userAgent === 'string') {
           userAgent = parsed.userAgent.trim();
           lsSet(LS_UA_KEY, userAgent);
+        }
+        if (typeof parsed.deviceLabel === 'string') {
+          deviceLabel = parsed.deviceLabel.trim() || DEFAULT_DEVICE_LABEL;
+          lsSet(LS_DEVICE_LABEL_KEY, deviceLabel);
         }
         syncSettingsInputs();
         setBanner('Imported browser settings.', 'ok');
@@ -5069,11 +5078,13 @@
       const acInput = container.querySelector('#sg-auto-compact');
       const owInput = container.querySelector('#sg-overwrite-lower');
       const jnInput = container.querySelector('#sg-journal-notes');
+      const dlInput = container.querySelector('#sg-device-label');
       if (cInput) cInput.value = lsGet(LS_COOKIE_KEY, '');
       if (uInput) uInput.value = userAgent || '';
       if (acInput) acInput.checked = autoCompact;
       if (owInput) owInput.checked = overwriteLowerInBatch;
       if (jnInput) jnInput.checked = includeJournalNotes;
+      if (dlInput) dlInput.value = deviceLabel || DEFAULT_DEVICE_LABEL;
       updateCookieBadge();
     }
 
@@ -5456,7 +5467,7 @@
 
       if (allRows.length === 0) {
         listEl.innerHTML =
-          '<p class="sg-muted">No reading events recorded yet. Open a book on the X4 Pro, read a few pages, and exit back to Home.</p>';
+          '<p class="sg-muted">No reading events recorded yet. Open a book on your e-reader, read a few pages, and exit back to Home.</p>';
         return;
       }
 
@@ -5652,7 +5663,7 @@
       }
 
       const noteHtml =
-        `<div class="sg-muted">Pick any book on your SD card to link and Mark Read, or pre-link before your next reading session. Progress % for untouched books appears after you open &amp; exit the book once on the X4 Pro.</div>`;
+        `<div class="sg-muted">Pick any book on your SD card to link and Mark Read, or pre-link before your next reading session. Progress % for untouched books appears after you open &amp; exit the book once on your e-reader.</div>`;
 
       box.innerHTML = noteHtml + barHtml + bodyHtml;
 
@@ -5799,7 +5810,11 @@
             '<input type="text" id="sg-ua-input" class="sg-input" />' +
           '</div>' +
           '<div class="sg-field">' +
-            '<label class="sg-muted sg-check" title="Save session duration (e.g. 20m read on X4 Pro) inside StoryGraph reading journal notes"><input type="checkbox" id="sg-journal-notes" /> Include reading duration in StoryGraph journal notes</label>' +
+            '<label for="sg-device-label">Journal device label (optional, default: CrossPoint)</label>' +
+            '<input type="text" id="sg-device-label" class="sg-input" placeholder="CrossPoint" />' +
+          '</div>' +
+          '<div class="sg-field">' +
+            '<label class="sg-muted sg-check" title="Save session duration (e.g. 20m read on CrossPoint) inside StoryGraph reading journal notes"><input type="checkbox" id="sg-journal-notes" /> Include reading duration in StoryGraph journal notes</label>' +
           '</div>' +
           '<div class="sg-row">' +
             '<button type="button" class="sg-btn sg-btn-primary" id="sg-verify">Verify Session</button>' +
@@ -5866,6 +5881,10 @@
     container.querySelector('#sg-journal-notes').addEventListener('change', (e) => {
       includeJournalNotes = Boolean(e.target.checked);
       lsSet(LS_JOURNAL_NOTES_KEY, includeJournalNotes ? '1' : '0');
+    });
+    container.querySelector('#sg-device-label').addEventListener('input', (e) => {
+      deviceLabel = String(e.target.value || '').trim() || DEFAULT_DEVICE_LABEL;
+      lsSet(LS_DEVICE_LABEL_KEY, deviceLabel);
     });
     container.querySelector('#sg-clear-cfg').addEventListener('click', () => {
       saveCookieMap({});

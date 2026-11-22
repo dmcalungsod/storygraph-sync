@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { createMockServer } from './server.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PLUGIN_JS_PATH = path.resolve(__dirname, '..', 'plugin', 'plugin.js');
+const PLUGIN_JS_PATH = path.resolve(__dirname, '..', 'storygraph-sync.crosspoint-plugin', 'plugin.js');
 
 // Minimal HTML tree + CSS selector DOMParser shim for Node tests
 const VOID_TAGS = new Set(['meta', 'input', 'img', 'br', 'hr', 'link']);
@@ -1013,7 +1013,7 @@ async function runTests() {
       bookNumOfPages: 464,
       lastReachedPages: 93,
       lastReachedPercent: 20,
-      note: '45m read on X4 Pro',
+      note: '45m read on CrossPoint',
       returnTo: 'https://app.thestorygraph.com/books/book-1'
     }));
     assert.equal(datedBody.get('progress_update_date[day]'), '22');
@@ -1021,7 +1021,7 @@ async function runTests() {
     assert.equal(datedBody.get('progress_update_date[year]'), '2026');
     assert.equal(datedBody.get('progress_number'), '255');
     assert.equal(datedBody.get('progress_type'), 'pages');
-    assert.equal(datedBody.get('note'), '45m read on X4 Pro');
+    assert.equal(datedBody.get('note'), '45m read on CrossPoint');
 
     const day1Noon = Math.floor(Date.UTC(2026, 9, 20, 12, 0, 0) / 1000);
     const day2Noon = Math.floor(Date.UTC(2026, 9, 22, 12, 0, 0) / 1000);
@@ -2461,10 +2461,10 @@ async function runTests() {
     assert.equal(mtJournalPosts.length, 2, 'Expected both multi-day sessions posted chronologically during Sync All');
     assert.equal(mtJournalPosts[0].date, '2026-11-18');
     assert.equal(mtJournalPosts[0].val, 40);
-    assert.equal(mtJournalPosts[0].note, '15m read on X4 Pro');
+    assert.equal(mtJournalPosts[0].note, '15m read on CrossPoint');
     assert.equal(mtJournalPosts[1].date, '2026-11-20');
     assert.equal(mtJournalPosts[1].val, 81);
-    assert.equal(mtJournalPosts[1].note, '25m read on X4 Pro');
+    assert.equal(mtJournalPosts[1].note, '25m read on CrossPoint');
     assert.equal(
       sgState.posts.filter((p) => p.bid === 'book-mt-9' && p.path === '/update-progress').length,
       0,
@@ -2795,7 +2795,12 @@ async function runTests() {
     assert.equal(midSess.startDate, '2026-11-21', 'Test 15: Midnight session must record startDate on Day 1');
     assert.equal(midSess.date, '2026-11-22', 'Test 15: Midnight session must assign canonical journal date on Day 2 (endTime)');
     const midNote = sg.formatSessionJournalNote(midSess, true);
-    assert.equal(midNote, '23:40 (Nov 21)–00:25 · 45m read on X4 Pro', 'Test 15: Midnight note must show date crossover');
+    assert.equal(midNote, '23:40 (Nov 21)–00:25 · 45m read on CrossPoint', 'Test 15: Midnight note must show date crossover');
+    assert.equal(
+      sg.formatSessionJournalNote(midSess, true, 'X4 Pro'),
+      '23:40 (Nov 21)–00:25 · 45m read on X4 Pro',
+      'Custom deviceLabel must override default CrossPoint label'
+    );
 
     // Test 1, 2, 3, 5, 7, 11: End-to-end UI rendering & StoryGraph sync of multiple same-day sessions (including identical progress/duration & disabled notes)
     sgState.books['book-daily-laws'].statusLabel = 'currently reading';
@@ -2862,9 +2867,9 @@ async function runTests() {
     );
     const diaryPosts = sgState.posts.filter((p) => p.bid === 'book-daily-laws' && p.path === '/update-progress-with-note');
     assert.equal(diaryPosts.length, 4, 'Test 1: All 3 same-day sessions + 1 progress checkpoint must be posted independently');
-    assert.equal(diaryPosts[0].note, '09:15 · 15s read on X4 Pro');
-    assert.equal(diaryPosts[1].note, '13:40–13:52 · 12m read on X4 Pro');
-    assert.equal(diaryPosts[2].note, '20:10–20:55 · 45m read on X4 Pro');
+    assert.equal(diaryPosts[0].note, '09:15 · 15s read on CrossPoint');
+    assert.equal(diaryPosts[1].note, '13:40–13:52 · 12m read on CrossPoint');
+    assert.equal(diaryPosts[2].note, '20:10–20:55 · 45m read on CrossPoint');
 
     // Test 7: Repeated synchronization sends 0 duplicate POSTs
     sgState.posts.length = 0;
@@ -2943,7 +2948,7 @@ async function runTests() {
     // Test 6 & 12: Interrupted synchronization reconciliation (single match vs ambiguous multiple matches)
     sgState.books['book-daily-laws'].journalEntries = [
       { entryId: 'je-pre-1', date: '2026-11-22', percent: 30, pages: 139, note: '' },
-      { entryId: 'je-inflight-single', date: '2026-11-22', percent: 35, pages: 162, note: '12m read on X4 Pro' }
+      { entryId: 'je-inflight-single', date: '2026-11-22', percent: 35, pages: 162, note: '12m read on CrossPoint' }
     ];
     await mockApi.writeFile(
       '/.crosspoint/plugins/storygraph-sync/events.jsonl',
@@ -2997,8 +3002,8 @@ async function runTests() {
     // Test 12: Ambiguous multiple remote matches after interrupted sync -> flags needs_reconciliation without guessing or re-posting
     sgState.books['book-daily-laws'].journalEntries = [
       { entryId: 'je-pre-1', date: '2026-11-22', percent: 30, pages: 139, note: '' },
-      { entryId: 'je-ambig-a', date: '2026-11-22', percent: 40, pages: 186, note: '15m read on X4 Pro' },
-      { entryId: 'je-ambig-b', date: '2026-11-22', percent: 40, pages: 186, note: '15m read on X4 Pro' }
+      { entryId: 'je-ambig-a', date: '2026-11-22', percent: 40, pages: 186, note: '15m read on CrossPoint' },
+      { entryId: 'je-ambig-b', date: '2026-11-22', percent: 40, pages: 186, note: '15m read on CrossPoint' }
     ];
     await mockApi.writeFile(
       '/.crosspoint/plugins/storygraph-sync/reading-history.json',
@@ -3052,7 +3057,7 @@ async function runTests() {
     sgState.books['book-mt-9'].lastReachedPages = 243;
     sgState.books['book-mt-9'].journalEntries = [
       { entryId: 'je-mt10-start', date: '2026-11-21', statusKind: 'started', isStatus: true },
-      { entryId: 'je-mt10-76', date: '2026-11-22', statusKind: null, isStatus: false, percent: 76, pages: 243, pagesDelta: 121, totalPages: 320, note: '40m read on X4 Pro' }
+      { entryId: 'je-mt10-76', date: '2026-11-22', statusKind: null, isStatus: false, percent: 76, pages: 243, pagesDelta: 121, totalPages: 320, note: '40m read on CrossPoint' }
     ];
     sgState.posts.length = 0;
     await mockApi.writeFile(
@@ -3112,7 +3117,7 @@ async function runTests() {
     );
     const final100Posts = sgState.posts.filter((p) => p.bid === 'book-mt-9' && p.path === '/update-progress-with-note' && p.val === 100);
     assert.equal(final100Posts.length, 1, 'Test 10: Genuine final 100% reading_session must be posted to StoryGraph journal');
-    assert.equal(final100Posts[0].note, '20:10–20:55 · 45m read on X4 Pro');
+    assert.equal(final100Posts[0].note, '20:10–20:55 · 45m read on CrossPoint');
 
     // Test 13: Even if StoryGraph also has a Finished status entry with duplicate pages, Clean Journals preserves the final 100% session and clears Finished duplicate page delta
     sgState.books['book-mt-9'].journalEntries.push({
@@ -3384,7 +3389,7 @@ async function runTests() {
       return undefined;
     };
     sgState.books['book-daily-laws'].journalEntries = [
-      { entryId: 'je-t1-ok', date: '2026-11-22', percent: 24, pages: 111, note: '55m 15s read on X4 Pro' }
+      { entryId: 'je-t1-ok', date: '2026-11-22', percent: 24, pages: 111, note: '55m 15s read on CrossPoint' }
     ];
     await cleanJournalsBtn.trigger('click');
     await waitForLong(

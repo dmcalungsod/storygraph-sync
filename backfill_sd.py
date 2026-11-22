@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-USB / SD card historical reading progress backfill for StoryGraph Sync (v0.1.0).
+USB / SD card historical reading progress backfill for StoryGraph Sync (v1.0.0).
 
-Reads CrossInk's on-device caches inside /.crosspoint/epub_*/:
+Reads CrossPoint / CrossInk on-device caches inside /.crosspoint/epub_*/:
   - progress_percent.bin ("PRPE" whole-book percentage)
   - progress.bin         (<HHHI spineIndex, page, pageCount, offset -> % via EPUB spine sizes)
   - stats_v5.bin         (reading sessions, duration seconds, pages turned, last date YYYY-MM-DD)
@@ -29,9 +29,9 @@ import zipfile
 
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
-LOCAL_PLUGIN_DIR = SCRIPT_DIR / "plugin"
+LOCAL_PLUGIN_DIR = SCRIPT_DIR / "storygraph-sync.crosspoint-plugin"
 PLUGIN_REL_DIR = pathlib.Path(".crosspoint") / "plugins" / "storygraph-sync"
-PLUGIN_FILES = ["manifest.json", "device.json", "plugin.js", "README.md"]
+PLUGIN_FILES = ["manifest.json", "device.json", "plugin.js", "README.md", "DETAILS.md"]
 
 
 def fnv1a_64(text: str) -> int:

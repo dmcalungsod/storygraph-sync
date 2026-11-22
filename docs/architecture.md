@@ -1,7 +1,7 @@
 # StoryGraph Sync Plugin — MVP Build Plan
 
 **Target Hardware:** XTEInk X4 Pro (`xteink_x4_pro`, ESP32-S3, ~99 KB typical free heap in File Transfer mode)  
-**Target Firmware:** CrossInk `v2.0.0-0b939f4-RC` (`firmwareFamily: "crosspoint"`, `pluginApi: 1`)  
+**Target Firmware:** CrossInk `2.0.0 RC3` (`firmwareFamily: "crosspoint"`, `pluginApi: 1`) — compatible with CrossPoint 2.0.0 RC / nightly builds  
 **Plugin Runtime:** Hybrid SD-Card Plugin — declarative `device.json` firmware event subscriber (`events.jsonl` outbox) + Browser-Mounted Web UI (`plugin.js`, `"mount": "files"`)  
 **Verified `pluginCapabilities`:** `catalog.lists`, `catalog.notices`, `catalog.bundle_install`, `catalog.version_tracking`, `catalog.compatibility`, `catalog.item_details`, `events.reader.open`, `events.reader.exit`, `events.reader.session`, `events.book.downloaded`, `events.sleep.enter`, `crypto`, `book.key`, `book.protected`, `catalog.encoded_item_fields`
 
