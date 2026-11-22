@@ -1344,11 +1344,14 @@ async function runTests() {
     const store = new Map();
     const toasts = [];
     let sdApiCalls = 0;
+    let tmpFetchReadCount = 0;
     let confirmCalls = 0;
     let confirmResult = true;
     let uiRegisteredPlugin = null;
     const nodeFetch = globalThis.fetch;
     const uiSandbox = {
+      __SG_FETCH_RETRY_DELAYS_MS: [10, 20],
+      __SG_CLEAN_PACING_MS: 10,
       DOMParser: MiniDOMParser,
       URLSearchParams,
       TextEncoder,
@@ -1374,6 +1377,7 @@ async function runTests() {
       fetch: (url, opts) => {
         const s = String(url);
         if (s.includes('/api/files')) sdApiCalls += 1;
+        if (s.includes('tmp-fetch.html')) tmpFetchReadCount += 1;
         return nodeFetch(s.startsWith('http') ? s : base + s, opts);
       },
       CrossPoint: {
@@ -1389,6 +1393,8 @@ async function runTests() {
     let forceCloudflare = false;
     let force502AfterApply = false;
     let force502BeforeApply = false;
+    let fetchToSdInterceptor = null;
+    const fetchToSdCalls = [];
     const mockContainer = new MockUiElement('div', { id: 'plugin-storygraph-sync' });
     const mockApi = {
       name: 'storygraph-sync',
@@ -1418,6 +1424,11 @@ async function runTests() {
         };
       },
       async fetchToSd(url, dest, headers = {}) {
+        fetchToSdCalls.push({ url, dest });
+        if (typeof fetchToSdInterceptor === 'function') {
+          const custom = await fetchToSdInterceptor(url, dest, headers);
+          if (custom !== undefined) return custom;
+        }
         const hdrs = forceCloudflare ? { ...headers, 'X-Mock-Cloudflare': '1' } : headers;
         const r = await nodeFetch(`${base}/api/fetch`, {
           method: 'POST',
@@ -3121,6 +3132,464 @@ async function runTests() {
     assert.equal(planFinal100.updates.length, 1, 'Test 13: Clean Journals must clear duplicate page credit on Finished alongside genuine 100% sitting');
     assert.equal(planFinal100.updates[0].entryId, 'je-mt10-fin');
     assert.equal(planFinal100.updates[0].pagesRead, 0);
+
+    // Case 12: /api/fetch Reliability, Cleanup Verification Cache & Consistent Progress/Session Count (14 Acceptance Tests)
+    // Pure helper unit checks (Tests 10, 11, 12, 13 & error classification)
+    assert.equal(sg.isTransientFetchError(new Error('/api/fetch: transport failure')), true);
+    assert.equal(sg.isTransientFetchError(new Error('socket ECONNRESET')), true);
+    assert.equal(sg.isTransientFetchError(Object.assign(new Error('HTTP 502'), { status: 502 })), true);
+    assert.equal(sg.isTransientFetchError(Object.assign(new Error('HTTP 504'), { status: 504 })), true);
+    assert.equal(sg.isTransientFetchError(Object.assign(new Error('HTTP 401'), { status: 401 })), false);
+    assert.equal(sg.isTransientFetchError(Object.assign(new Error('HTTP 403'), { status: 403 })), false);
+    assert.equal(sg.isTransientFetchError(Object.assign(new Error('HTTP 503'), { status: 503 })), false);
+    assert.equal(sg.isTransientFetchError(new Error('Cloudflare challenge detected')), false);
+
+    // Acceptance Test 12 & 13: computePercentFromBp (15 bp -> 1%, 0 bp -> 0%) consistently across all paths
+    assert.equal(sg.computePercentFromBp(15, 10000), 1, 'Test 12: 15 bp must convert to 1%');
+    assert.equal(sg.computePercentFromBp(0, 10000), 0, 'Test 13: 0 bp must remain 0%');
+    assert.equal(sg.computePercentFromBp(2380, 10000), 24);
+
+    // normalizeSessionRecord via cloneHistoryData (including self-healing stored startPercent: 0 with startProgressBp: 15)
+    const bpNormHist = sg.cloneHistoryData({
+      version: 2,
+      books: {
+        [lawsPath]: {
+          sessions: [
+            {
+              sessionId: 'bp-heal-1',
+              recordType: 'reading_session',
+              date: '2026-11-22',
+              startProgressBp: 15,
+              endProgressBp: 2380,
+              progressScale: 10000,
+              startPercent: 0,
+              endPercent: 24,
+              durationSeconds: 3315
+            },
+            {
+              sessionId: 'bp-zero-1',
+              recordType: 'reading_session',
+              date: '2026-11-22',
+              startProgressBp: 0,
+              endProgressBp: 15,
+              progressScale: 10000,
+              durationSeconds: 28
+            }
+          ]
+        }
+      }
+    });
+    assert.equal(bpNormHist.books[lawsPath].sessions[0].startPercent, 1, 'Test 12: normalizeSessionRecord must compute/self-heal 15 bp -> 1%');
+    assert.equal(bpNormHist.books[lawsPath].sessions[0].endPercent, 24);
+    assert.equal(bpNormHist.books[lawsPath].sessions[1].startPercent, 0, 'Test 13: normalizeSessionRecord must keep 0 bp -> 0%');
+    assert.equal(bpNormHist.books[lawsPath].sessions[1].endPercent, 1);
+
+    // mergeEventsIntoHistory 15 bp -> 1%, 0 bp -> 0%
+    const bpMergeRes = sg.mergeEventsIntoHistory(
+      { version: 2, books: {} },
+      [
+        JSON.stringify({
+          e: 'reader.session',
+          id: 'bp-merge-15',
+          ts: t0915 + 60,
+          vars: { book: lawsPath, start_progress_bp: '15', end_progress_bp: '2380', progress_scale: '10000', duration_seconds: '60' }
+        }),
+        JSON.stringify({
+          e: 'reader.session',
+          id: 'bp-merge-0',
+          ts: t0915 + 120,
+          vars: { book: lawsPath, start_progress_bp: '0', end_progress_bp: '15', progress_scale: '10000', duration_seconds: '28' }
+        })
+      ].join('\n')
+    );
+    assert.equal(bpMergeRes.history.books[lawsPath].sessions[0].startPercent, 1, 'Test 12: mergeEventsIntoHistory must compute 15 bp -> 1%');
+    assert.equal(bpMergeRes.history.books[lawsPath].sessions[1].startPercent, 0, 'Test 13: mergeEventsIntoHistory must keep 0 bp -> 0%');
+    assert.equal(bpMergeRes.history.books[lawsPath].sessions[1].endPercent, 1);
+
+    // importSessionHistoryPayload 15 bp -> 1%, 0 bp -> 0%
+    const bpImportRes = sg.importSessionHistoryPayload(
+      { version: 2, books: {} },
+      [
+        { sdPath: lawsPath, date: '2026-11-22', start_progress_bp: 15, end_progress_bp: 2380, progress_scale: 10000, duration_seconds: 60 },
+        { sdPath: lawsPath, date: '2026-11-22', start_progress_bp: 0, end_progress_bp: 15, progress_scale: 10000, duration_seconds: 28 }
+      ],
+      [{ sdPath: lawsPath, title: 'Sample Non-Fiction A' }]
+    );
+    const bpImp15 = bpImportRes.history.books[lawsPath].sessions.find((s) => s.startProgressBp === 15);
+    const bpImp0 = bpImportRes.history.books[lawsPath].sessions.find((s) => s.startProgressBp === 0);
+    assert.ok(bpImp15 && bpImp0, 'Expected both imported bp records');
+    assert.equal(bpImp15.startPercent, 1, 'Test 12: importSessionHistoryPayload must compute 15 bp -> 1%');
+    assert.equal(bpImp15.endPercent, 24);
+    assert.equal(bpImp0.startPercent, 0, 'Test 13: importSessionHistoryPayload must keep 0 bp -> 0%');
+    assert.equal(bpImp0.endPercent, 1);
+
+    // Acceptance Test 10: Single-event legacy migration retains legacy_daily_summary unless verified reader.session arrives
+    const singleLegV1 = sg.cloneHistoryData({
+      version: 1,
+      books: {
+        [lawsPath]: {
+          days: {
+            '2026-11-22': {
+              date: '2026-11-22',
+              startPercent: 0,
+              endPercent: 1,
+              durationSeconds: 28,
+              sessions: 1,
+              syncedToJournal: true,
+              seenIds: ['orig-sess-1']
+            }
+          }
+        }
+      }
+    });
+    assert.equal(singleLegV1.books[lawsPath].sessions.length, 1);
+    assert.equal(singleLegV1.books[lawsPath].sessions[0].recordType, 'legacy_daily_summary', 'Test 10: v1 single-event daily summary must remain legacy_daily_summary without fabricated reading_session');
+
+    // A non-session reader.exit checkpoint with same id must NOT replace the legacy_daily_summary
+    const afterExitOnly = sg.mergeEventsIntoHistory(
+      singleLegV1,
+      JSON.stringify({ e: 'reader.exit', id: 'orig-sess-1', ts: t0915 + 28, vars: { book: lawsPath, percent: '1' } })
+    );
+    assert.ok(
+      afterExitOnly.history.books[lawsPath].sessions.some((s) => s.recordType === 'legacy_daily_summary'),
+      'Test 10: reader.exit checkpoint must not replace legacy_daily_summary'
+    );
+
+    // A verified reader.session event with matching id replaces the legacy_daily_summary cleanly
+    const afterVerifiedSession = sg.mergeEventsIntoHistory(
+      singleLegV1,
+      JSON.stringify({
+        e: 'reader.session',
+        id: 'orig-sess-1',
+        ts: t0915 + 28,
+        vars: { book: lawsPath, start_time: String(t0915), end_time: String(t0915 + 28), duration_seconds: '28', start_progress_bp: '0', end_progress_bp: '15', progress_scale: '10000' }
+      })
+    );
+    assert.equal(afterVerifiedSession.history.books[lawsPath].sessions.length, 1, 'Test 10: Verified reader.session must replace single-event legacy_daily_summary');
+    assert.equal(afterVerifiedSession.history.books[lawsPath].sessions[0].recordType, 'reading_session');
+    assert.equal(afterVerifiedSession.history.books[lawsPath].sessions[0].sessionId, 'orig-sess-1');
+
+    // Acceptance Test 11: Multiple-event legacy migration + mixed real/legacy UI session count display
+    const multiLegV1 = sg.cloneHistoryData({
+      version: 1,
+      books: {
+        [lawsPath]: {
+          days: {
+            '2026-11-22': {
+              date: '2026-11-22',
+              startPercent: 0,
+              endPercent: 10,
+              durationSeconds: 1800,
+              sessions: 3,
+              syncedToJournal: true,
+              seenIds: ['m-1', 'm-2', 'm-3']
+            }
+          }
+        }
+      }
+    });
+    assert.equal(multiLegV1.books[lawsPath].sessions.length, 1);
+    assert.equal(multiLegV1.books[lawsPath].sessions[0].recordType, 'legacy_daily_summary', 'Test 11: Multi-event v1 summary must remain legacy_daily_summary');
+    assert.equal(multiLegV1.books[lawsPath].sessions[0].legacySessionCount, 3);
+
+    // Verify UI renders honest session total for mixed real + legacy (1 real + 1 legacy = 2 sessions; 1 real + 3 legacy = 4 sessions)
+    await mockApi.writeFile(
+      '/.crosspoint/plugins/storygraph-sync/events.jsonl',
+      Buffer.from('\n', 'utf8').toString('base64')
+    );
+    await mockApi.writeFile(
+      '/.crosspoint/plugins/storygraph-sync/reading-history.json',
+      Buffer.from(
+        JSON.stringify({
+          version: 2,
+          books: {
+            [lawsPath]: {
+              sessions: [
+                {
+                  sessionId: 'legacy:2026-11-22',
+                  recordType: 'legacy_daily_summary',
+                  date: '2026-11-22',
+                  startPercent: 0,
+                  endPercent: 1,
+                  durationSeconds: 28,
+                  legacySessionCount: 1,
+                  seenIds: ['orig-1'],
+                  syncStatus: 'synced',
+                  syncedToJournal: true
+                },
+                {
+                  sessionId: 'real-sess-2',
+                  recordType: 'reading_session',
+                  date: '2026-11-22',
+                  startTime: t1340,
+                  endTime: t1340 + 3315,
+                  startProgressBp: 15,
+                  endProgressBp: 2380,
+                  progressScale: 10000,
+                  startPercent: 0,
+                  endPercent: 24,
+                  durationSeconds: 3315,
+                  syncStatus: 'synced',
+                  syncedToJournal: true
+                }
+              ]
+            }
+          }
+        }),
+        'utf8'
+      ).toString('base64')
+    );
+    await mockApi.writeFile(
+      '/.crosspoint/plugins/storygraph-sync/storygraph-map.json',
+      Buffer.from(
+        JSON.stringify({
+          version: 1,
+          books: {
+            [lawsPath]: {
+              bookId: 'book-daily-laws',
+              title: 'Sample Non-Fiction A',
+              author: 'Author Alpha',
+              sdPath: lawsPath,
+              status: 'currently-reading',
+              lastSyncedPercent: 24
+            }
+          }
+        }),
+        'utf8'
+      ).toString('base64')
+    );
+    await refreshBtn.trigger('click');
+    assert.ok(
+      booksListEl.textContent.includes('2 sessions · 55m 43s total'),
+      `Test 11: Expected honest 2-session total in UI header, got "${booksListEl.textContent.slice(0, 400)}"`
+    );
+    assert.ok(
+      booksListEl.textContent.includes('1% → 24%'),
+      `Test 12: Expected self-healed 1% → 24% display for 15 bp start, got "${booksListEl.textContent.slice(0, 400)}"`
+    );
+    assert.ok(
+      booksListEl.textContent.includes('Daily summary (1 session)'),
+      'Test 10/11: Expected legacy daily summary to retain honest label'
+    );
+
+    // Acceptance Tests 1-5: fetchStoryGraphHtml retry, exhaustion, non-retryable HTTP 401/403/503, and stale tmp-fetch.html guard
+    // Test 1: Transient transport failure on attempt 1, then success on attempt 2
+    fetchToSdCalls.length = 0;
+    let t1Count = 0;
+    fetchToSdInterceptor = async (url) => {
+      if (url.includes('/journal?book_id=')) {
+        t1Count++;
+        if (t1Count === 1) throw new Error('/api/fetch: transport failure');
+      }
+      return undefined;
+    };
+    sgState.books['book-daily-laws'].journalEntries = [
+      { entryId: 'je-t1-ok', date: '2026-11-22', percent: 24, pages: 111, note: '55m 15s read on X4 Pro' }
+    ];
+    await cleanJournalsBtn.trigger('click');
+    await waitForLong(
+      () => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled,
+      'Test 1: Expected transient transport failure to retry and succeed'
+    );
+    fetchToSdInterceptor = null;
+    assert.equal(t1Count, 2, 'Test 1: Expected exactly 2 attempts (1 transient failure + 1 retry success)');
+    assert.ok(
+      !bannerEl.className.includes('sg-err') && bannerEl.textContent.includes('verified clean'),
+      `Test 1: Expected successful recovery banner, got "${bannerEl.textContent}"`
+    );
+
+    // Test 2 & Test 5: Three consecutive transient failures with stale tmp-fetch.html on SD
+    // Write a known stale HTML document to tmp-fetch.html before triggering failing fetch
+    await mockApi.writeFile(
+      '/.crosspoint/plugins/storygraph-sync/tmp-fetch.html',
+      Buffer.from(
+        '<!DOCTYPE html><html><head><meta name="csrf-token" content="stale-tok"></head><body><span class="journal-entry-panes"><div class="mb-3"><p>22 November 2026 <a href="/journal_entries/je-stale-zero/edit">Edit</a></p><div>0%</div></div></span></body></html>',
+        'utf8'
+      ).toString('base64')
+    );
+    let t2Count = 0;
+    tmpFetchReadCount = 0;
+    sgState.posts.length = 0;
+    fetchToSdInterceptor = async () => {
+      t2Count++;
+      throw new Error('/api/fetch: transport failure');
+    };
+    await cleanJournalsBtn.trigger('click');
+    await waitForLong(
+      () => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled && bannerEl.className.includes('sg-err'),
+      'Test 2: Expected 3 consecutive transient failures to stop and report error'
+    );
+    fetchToSdInterceptor = null;
+    assert.equal(t2Count, 3, 'Test 2: Must stop after exactly 3 attempts (initial + 2 retries)');
+    assert.ok(
+      bannerEl.textContent.includes('after 3 attempts') && bannerEl.textContent.includes('transport failure'),
+      `Test 2: Expected error banner with attempt count, got "${bannerEl.textContent}"`
+    );
+    assert.equal(tmpFetchReadCount, 0, 'Test 5: Stale tmp-fetch.html must NEVER be read when fetchToSd fails');
+    assert.equal(sgState.posts.length, 0, 'Test 5: No cleanup POSTs may be triggered from stale tmp-fetch.html');
+
+    // Test 3: HTTP 401 and HTTP 403 fail immediately with 0 retries (attempts === 1)
+    for (const nonRetryStatus of [401, 403, 503]) {
+      let statusAttempts = 0;
+      tmpFetchReadCount = 0;
+      fetchToSdInterceptor = async () => {
+        statusAttempts++;
+        return { status: nonRetryStatus, bytes: 0, complete: false };
+      };
+      await cleanJournalsBtn.trigger('click');
+      await waitForLong(
+        () => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled && bannerEl.className.includes('sg-err'),
+        `Test 3/4: Expected HTTP ${nonRetryStatus} to fail immediately`
+      );
+      fetchToSdInterceptor = null;
+      assert.equal(statusAttempts, 1, `Test 3/4: HTTP ${nonRetryStatus} must fail immediately with 0 retries (attempts === 1)`);
+      assert.equal(tmpFetchReadCount, 0, `Test 5: Stale tmp-fetch.html must never be read on HTTP ${nonRetryStatus}`);
+      assert.ok(
+        bannerEl.textContent.includes(String(nonRetryStatus)),
+        `Test 3/4: Expected HTTP ${nonRetryStatus} in error banner, got "${bannerEl.textContent}"`
+      );
+    }
+
+    // Acceptance Tests 6, 7, 8, 9, 14: Watermarked cleanup cache, invalidation, pending guard, failed stamp guard, and partial batch failure
+    // Setup 3 linked Read books: Book 1 (book-done-100), Book 2 (book-mt-9), Book 3 (book-daily-stoic)
+    const cleanHistBase = {
+      version: 2,
+      books: {
+        [donePath]: {
+          sessions: [
+            { sessionId: 'b1-s1', recordType: 'reading_session', date: '2026-11-16', startPercent: 0, endPercent: 100, durationSeconds: 1200, syncStatus: 'synced', syncedToJournal: true, journalEntryId: 'je-b1-1' }
+          ]
+        },
+        [mtPath]: {
+          sessions: [
+            { sessionId: 'b2-s1', recordType: 'reading_session', date: '2026-11-18', startPercent: 0, endPercent: 100, durationSeconds: 1800, syncStatus: 'synced', syncedToJournal: true, journalEntryId: 'je-b2-1' }
+          ]
+        },
+        [stoicPath]: {
+          sessions: [
+            { sessionId: 'b3-s1', recordType: 'reading_session', date: '2026-11-20', startPercent: 0, endPercent: 100, durationSeconds: 900, syncStatus: 'synced', syncedToJournal: true, journalEntryId: 'je-b3-1' }
+          ]
+        }
+      }
+    };
+    const threeReadMap = {
+      version: 1,
+      books: {
+        [donePath]: { bookId: 'book-done-100', title: 'Finished Book Example', author: 'Author', sdPath: donePath, status: 'read', lastSyncedPercent: 100 },
+        [mtPath]: { bookId: 'book-mt-9', title: 'Sample Series Vol. 9', author: 'Author Gamma', sdPath: mtPath, status: 'read', lastSyncedPercent: 100 },
+        [stoicPath]: { bookId: 'book-daily-stoic', title: 'Sample Non-Fiction B', author: 'Author Beta', sdPath: stoicPath, status: 'read', lastSyncedPercent: 100 }
+      }
+    };
+    sgState.books['book-done-100'].journalEntries = [
+      { entryId: 'je-b1-1', date: '2026-11-16', statusKind: 'finished', isStatus: true, pagesDelta: 280, pages: 280, totalPages: 280 }
+    ];
+    sgState.books['book-mt-9'].journalEntries = [
+      { entryId: 'je-b2-1', date: '2026-11-18', statusKind: 'finished', isStatus: true, pagesDelta: 320, pages: 320, totalPages: 320 }
+    ];
+    sgState.books['book-daily-stoic'].journalEntries = [
+      { entryId: 'je-b3-1', date: '2026-11-20', statusKind: 'finished', isStatus: true, pagesDelta: 400, pages: 400, totalPages: 400 }
+    ];
+    await mockApi.writeFile('/.crosspoint/plugins/storygraph-sync/reading-history.json', Buffer.from(JSON.stringify(cleanHistBase), 'utf8').toString('base64'));
+    await mockApi.writeFile('/.crosspoint/plugins/storygraph-sync/storygraph-map.json', Buffer.from(JSON.stringify(threeReadMap), 'utf8').toString('base64'));
+    await mockApi.writeFile('/.crosspoint/plugins/storygraph-sync/backfill.json', Buffer.from(JSON.stringify({ books: {} }), 'utf8').toString('base64'));
+    await refreshBtn.trigger('click');
+
+    // Test 9 & Test 14: Partial batch failure (Book 1 ok, Book 2 fails 3 attempts, Book 3 ok)
+    fetchToSdCalls.length = 0;
+    fetchToSdInterceptor = async (url) => {
+      if (url.includes('book_id=book-mt-9')) {
+        throw new Error('/api/fetch: transport failure');
+      }
+      return undefined;
+    };
+    await cleanJournalsBtn.trigger('click');
+    await waitForLong(
+      () => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled && bannerEl.className.includes('sg-err'),
+      'Test 14: Expected partial batch cleanup to finish with 2 verified clean and 1 failed'
+    );
+    fetchToSdInterceptor = null;
+    assert.ok(
+      bannerEl.textContent.includes('2 verified clean') && bannerEl.textContent.includes('1 failed'),
+      `Test 14: Expected 2 verified clean + 1 failed breakdown, got "${bannerEl.textContent}"`
+    );
+    const mapAfterPartial = JSON.parse(virtualFiles.get('storygraph-map.json').toString('utf8'));
+    assert.ok(mapAfterPartial.books[donePath].lastJournalCleanedAt, 'Test 14: Book 1 must be stamped after verified success');
+    assert.ok(mapAfterPartial.books[stoicPath].lastJournalCleanedAt, 'Test 14: Book 3 must complete and be stamped despite Book 2 failure');
+    assert.equal(mapAfterPartial.books[mtPath].lastJournalCleanedAt, undefined, 'Test 9 & 14: Failed Book 2 must NOT be stamped with lastJournalCleanedAt');
+
+    // Test 6: Next Clean Journals run skips Book 1 and Book 3 (cached clean) and only fetches Book 2
+    fetchToSdCalls.length = 0;
+    await cleanJournalsBtn.trigger('click');
+    await waitForLong(
+      () => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled,
+      'Test 6: Expected cached cleanup run to finish'
+    );
+    assert.equal(fetchToSdCalls.length, 1, 'Test 6: Already-clean Read books (Book 1 & Book 3) must be skipped; only Book 2 fetched');
+    assert.ok(fetchToSdCalls[0].url.includes('book_id=book-mt-9'), 'Test 6: Only previously failed Book 2 should be fetched');
+    assert.ok(
+      bannerEl.textContent.includes('1 verified clean, 2 skipped'),
+      `Test 6: Expected "1 verified clean, 2 skipped" in banner, got "${bannerEl.textContent}"`
+    );
+
+    // Run once more with all 3 stamped -> 0 fetches (all 3 skipped)
+    fetchToSdCalls.length = 0;
+    await cleanJournalsBtn.trigger('click');
+    await waitForLong(
+      () => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled,
+      'Test 6: Expected fully cached cleanup run to finish with 0 fetches'
+    );
+    assert.equal(fetchToSdCalls.length, 0, 'Test 6: All 3 verified-clean Read books must require 0 /api/fetch requests');
+    assert.ok(bannerEl.textContent.includes('0 verified clean, 3 skipped'), `Expected 3 skipped, got "${bannerEl.textContent}"`);
+
+    // Test 7: Importing a new session for Book 1 invalidates/mismatches watermark and causes re-scan
+    const impTextArea = mockContainer.querySelector('#sg-history-textarea');
+    const impRunBtn = mockContainer.querySelector('#sg-history-import-run');
+    impTextArea.value = JSON.stringify([
+      { sdPath: donePath, sessionId: 'b1-s2-new', date: '2026-11-22', startPercent: 95, endPercent: 100, durationSeconds: 300, syncedToJournal: true }
+    ]);
+    await impRunBtn.trigger('click');
+    await waitForLong(
+      () => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled && bannerEl.textContent.includes('Imported 1 session'),
+      'Test 7: Expected session history import to complete'
+    );
+    const mapAfterImport = JSON.parse(virtualFiles.get('storygraph-map.json').toString('utf8'));
+    assert.equal(mapAfterImport.books[donePath].lastJournalCleanedAt, undefined, 'Test 7: Importing new session must invalidate Book 1 cleanup cache');
+    fetchToSdCalls.length = 0;
+    await cleanJournalsBtn.trigger('click');
+    await waitForLong(
+      () => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled,
+      'Test 7: Expected Clean Journals to re-scan Book 1 after new session import'
+    );
+    assert.equal(fetchToSdCalls.length, 1, 'Test 7: Only Book 1 (with new session) should be re-scanned');
+    assert.ok(fetchToSdCalls[0].url.includes('book_id=book-done-100'));
+
+    // Test 8: Pending or needs_reconciliation session on a Read book prevents skip even if watermark matches
+    const histWithPending = JSON.parse(virtualFiles.get('reading-history.json').toString('utf8'));
+    histWithPending.books[stoicPath].sessions[0].syncStatus = 'needs_reconciliation';
+    histWithPending.books[stoicPath].sessions[0].syncedToJournal = false;
+    const mapWithMatchingWatermark = JSON.parse(virtualFiles.get('storygraph-map.json').toString('utf8'));
+    mapWithMatchingWatermark.books[stoicPath].lastJournalCleanedWatermark = sg.computeBookJournalWatermark(
+      histWithPending,
+      { sdPath: stoicPath, mapping: mapWithMatchingWatermark.books[stoicPath] }
+    );
+    assert.equal(
+      sg.shouldSkipJournalCleanup({ sdPath: stoicPath, mapping: mapWithMatchingWatermark.books[stoicPath] }, histWithPending),
+      false,
+      'Test 8: Read book with needs_reconciliation session must NEVER skip cleanup'
+    );
+    await mockApi.writeFile('/.crosspoint/plugins/storygraph-sync/reading-history.json', Buffer.from(JSON.stringify(histWithPending), 'utf8').toString('base64'));
+    await mockApi.writeFile('/.crosspoint/plugins/storygraph-sync/storygraph-map.json', Buffer.from(JSON.stringify(mapWithMatchingWatermark), 'utf8').toString('base64'));
+    await refreshBtn.trigger('click');
+    fetchToSdCalls.length = 0;
+    await cleanJournalsBtn.trigger('click');
+    await waitForLong(
+      () => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled,
+      'Test 8: Expected Clean Journals to scan Read book with needs_reconciliation session'
+    );
+    assert.equal(fetchToSdCalls.length, 2, 'Test 8: Both Book 1 (pending imported session) and Book 3 (needs_reconciliation) must NOT be skipped, while clean Book 2 is skipped');
+    assert.ok(fetchToSdCalls.some((c) => c.url.includes('book_id=book-done-100')), 'Test 8: Book 1 (pending) must be fetched');
+    assert.ok(fetchToSdCalls.some((c) => c.url.includes('book_id=book-daily-stoic')), 'Test 8: Book 3 (needs_reconciliation) must be fetched');
+    assert.ok(!fetchToSdCalls.some((c) => c.url.includes('book_id=book-mt-9')), 'Test 8: Clean synced Book 2 must remain skipped');
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

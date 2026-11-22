@@ -17,6 +17,52 @@
   const FETCH_TMP_FILE = 'tmp-fetch.html';
   const OUTBOX_LIMIT_BYTES = 4096;
   const OUTBOX_WARN_BYTES = 3072;
+  const FETCH_RETRY_DELAYS_MS = [900, 1800];
+  const CLEAN_JOURNALS_PACING_MS = 600;
+
+  function computePercentFromBp(bpVal, scaleVal) {
+    const bp = toFiniteNumber(bpVal);
+    if (bp === null) return null;
+    if (bp <= 0) return 0;
+    const scaleRaw = toFiniteNumber(scaleVal);
+    const scale = scaleRaw && scaleRaw > 0 ? scaleRaw : 10000;
+    return Math.max(1, Math.min(100, Math.round((bp / scale) * 100)));
+  }
+
+  function isTransientFetchError(err, fetchRes) {
+    const st =
+      (fetchRes && typeof fetchRes.status === 'number' ? fetchRes.status : null) ??
+      (err && typeof err.status === 'number' ? err.status : null);
+    if (st === 401 || st === 403 || st === 503 || st === 422) return false;
+    const rawMsg =
+      (fetchRes && fetchRes.error ? String(fetchRes.error) + ' ' : '') +
+      (err && err.message ? String(err.message) : err ? String(err) : '');
+    const lower = rawMsg.toLowerCase();
+    if (
+      lower.includes('cloudflare') ||
+      lower.includes('sign_in') ||
+      lower.includes('expired') ||
+      lower.includes('blocked') ||
+      /\b(401|403|503|422)\b/.test(lower)
+    ) {
+      return false;
+    }
+    if (st === 502 || st === 504 || st === 408 || st === 500) return true;
+    if (fetchRes && fetchRes.complete === false) return true;
+    return (
+      lower.includes('transport failure') ||
+      lower.includes('timeout') ||
+      lower.includes('timed out') ||
+      lower.includes('socket') ||
+      lower.includes('econnreset') ||
+      lower.includes('econnrefused') ||
+      lower.includes('epipe') ||
+      lower.includes('network') ||
+      lower.includes('failed to fetch') ||
+      lower.includes('incomplete') ||
+      /\b(502|504)\b/.test(lower)
+    );
+  }
 
   function pluginPath(dir, filename) {
     const cleanDir =
@@ -978,13 +1024,12 @@
     const endProgressBp = toFiniteNumber(raw.endProgressBp ?? raw.end_progress_bp);
     const progressScale = toFiniteNumber(raw.progressScale ?? raw.progress_scale) || 10000;
     let startPercent = toFiniteNumber(raw.startPercent);
-    if (startPercent === null && startProgressBp !== null) {
-      startPercent = Math.max(0, Math.min(100, Math.round((startProgressBp / progressScale) * 100)));
+    if (startProgressBp !== null && (startPercent === null || (startPercent === 0 && startProgressBp > 0))) {
+      startPercent = computePercentFromBp(startProgressBp, progressScale);
     }
     let endPercent = toFiniteNumber(raw.endPercent);
-    if (endPercent === null && endProgressBp !== null) {
-      const rawPct = Math.round((endProgressBp / progressScale) * 100);
-      endPercent = endProgressBp > 0 ? Math.max(1, Math.min(100, rawPct)) : 0;
+    if (endProgressBp !== null && (endPercent === null || (endPercent === 0 && endProgressBp > 0))) {
+      endPercent = computePercentFromBp(endProgressBp, progressScale);
     }
     const synced = Boolean(raw.syncedToJournal || raw.syncStatus === 'synced');
     const syncStatus =
@@ -1246,15 +1291,19 @@
       return changed;
     }
 
-    // If a legacy_daily_summary had this sessionId in seenIds, remove that seenId (and remove the legacy summary if all seenIds are now real sessions)
-    for (let i = bookRec.sessions.length - 1; i >= 0; i--) {
-      const s = bookRec.sessions[i];
-      if (s.recordType === 'legacy_daily_summary' && Array.isArray(s.seenIds) && s.seenIds.includes(norm.sessionId)) {
-        s.seenIds = s.seenIds.filter((id) => id !== norm.sessionId && !String(id).startsWith('legacy:'));
-        if (s.seenIds.length === 0) {
-          bookRec.sessions.splice(i, 1);
+    // If a verified reading_session matches a legacy_daily_summary seenId, remove that seenId (and drop the legacy summary once all seenIds are covered)
+    if (norm.recordType === 'reading_session') {
+      for (let i = bookRec.sessions.length - 1; i >= 0; i--) {
+        const s = bookRec.sessions[i];
+        if (s.recordType === 'legacy_daily_summary' && Array.isArray(s.seenIds) && s.seenIds.includes(norm.sessionId)) {
+          s.seenIds = s.seenIds.filter((id) => id !== norm.sessionId && !String(id).startsWith('legacy:'));
+          if (s.seenIds.length === 0) {
+            bookRec.sessions.splice(i, 1);
+          } else if (s.legacySessionCount > 1) {
+            s.legacySessionCount = Math.max(1, s.legacySessionCount - 1);
+          }
+          changed = true;
         }
-        changed = true;
       }
     }
 
@@ -1323,7 +1372,7 @@
       const scaleRaw = toFiniteNumber(vars.progress_scale);
       const scale = scaleRaw && scaleRaw > 0 ? scaleRaw : 10000;
       if (startPct === null && startBp !== null) {
-        startPct = Math.max(0, Math.min(100, Math.round((startBp / scale) * 100)));
+        startPct = computePercentFromBp(startBp, scale);
       }
       const dur = Math.max(0, Math.round(toFiniteNumber(vars.duration_seconds) || 0));
       const evId = ev.id ? String(ev.id) : '';
@@ -1770,7 +1819,7 @@
       const scaleRaw = toFiniteNumber(s.progress_scale ?? s.progressScale);
       const scale = scaleRaw && scaleRaw > 0 ? scaleRaw : 10000;
       if (startPct === null && startBp !== null) {
-        startPct = Math.max(0, Math.min(100, Math.round((startBp / scale) * 100)));
+        startPct = computePercentFromBp(startBp, scale);
       }
       const dur = Math.max(
         0,
@@ -2153,16 +2202,68 @@
     }
     const endBp = toFiniteNumber(vars.end_progress_bp);
     if (endBp !== null) {
-      const scaleRaw = toFiniteNumber(vars.progress_scale);
-      const scale = scaleRaw && scaleRaw > 0 ? scaleRaw : 10000;
-      const rawPct = Math.round((endBp / scale) * 100);
-      return endBp > 0 ? Math.max(1, Math.min(100, rawPct)) : 0;
+      return computePercentFromBp(endBp, vars.progress_scale);
     }
     const pct = toFiniteNumber(vars.percent);
     if (pct !== null) {
       return Math.max(0, Math.min(100, Math.round(pct)));
     }
     return null;
+  }
+
+  function computeBookJournalWatermark(historyData, row) {
+    const sessions = getBookHistorySessions(historyData, row);
+    const tokens = sessions.map(
+      (s) =>
+        `${s.sessionId || ''}:${s.recordType || ''}:${s.syncStatus || (s.syncedToJournal ? 'synced' : 'pending')}:${s.journalEntryId || ''}:${s.endPercent ?? ''}:${s.durationSeconds || 0}`
+    );
+    return `v1|${sessions.length}|${tokens.join(';')}`;
+  }
+
+  function invalidateBookCleanupCache(mapping) {
+    if (!mapping || typeof mapping !== 'object') return false;
+    let changed = false;
+    for (const k of [
+      'lastJournalCleanedAt',
+      'lastJournalCleanedBookId',
+      'lastJournalCleanedSessionCount',
+      'lastJournalCleanedWatermark'
+    ]) {
+      if (Object.prototype.hasOwnProperty.call(mapping, k)) {
+        delete mapping[k];
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  function stampBookCleanupVerified(mapping, historyData, row, timestampIso) {
+    if (!mapping || typeof mapping !== 'object') return false;
+    const sessions = getBookHistorySessions(historyData, row);
+    mapping.lastJournalCleanedAt = timestampIso || new Date().toISOString();
+    mapping.lastJournalCleanedBookId = mapping.bookId || '';
+    mapping.lastJournalCleanedSessionCount = sessions.length;
+    mapping.lastJournalCleanedWatermark = computeBookJournalWatermark(historyData, row);
+    return true;
+  }
+
+  function shouldSkipJournalCleanup(row, historyData) {
+    const mapping = row && row.mapping;
+    if (!mapping || !mapping.bookId) return false;
+    if (mapping.status !== 'read') return false;
+    if (!mapping.lastJournalCleanedAt) return false;
+    if (mapping.lastJournalCleanedBookId !== mapping.bookId) return false;
+    const sessions = getBookHistorySessions(historyData, row);
+    const hasActiveSyncState = sessions.some(
+      (s) =>
+        s &&
+        (s.syncStatus === 'pending' ||
+          s.syncStatus === 'in_flight' ||
+          s.syncStatus === 'needs_reconciliation' ||
+          (!s.syncedToJournal && s.syncStatus !== 'synced'))
+    );
+    if (hasActiveSyncState) return false;
+    return mapping.lastJournalCleanedWatermark === computeBookJournalWatermark(historyData, row);
   }
 
   function reduceEventsJsonl(jsonlText) {
@@ -2764,6 +2865,14 @@
       buildJournalEntryUpdateBody,
       buildJournalEntryDeleteBody,
       planJournalCleanup,
+      FETCH_RETRY_DELAYS_MS,
+      CLEAN_JOURNALS_PACING_MS,
+      isTransientFetchError,
+      computePercentFromBp,
+      computeBookJournalWatermark,
+      invalidateBookCleanupCache,
+      stampBookCleanupVerified,
+      shouldSkipJournalCleanup,
       buildDatedProgressFormBody,
       cloneHistoryData,
       mergeEventsIntoHistory,
@@ -2994,10 +3103,64 @@
       }
       const dest = pluginPath(PLUGIN_DIR, FETCH_TMP_FILE);
       const headers = fitHeadersForCrossInk(buildHeaders(), cookieMap);
-      const fetchRes = await api.fetchToSd(url, dest, headers);
-      if (fetchRes && (fetchRes.status === 403 || fetchRes.status === 503)) {
-        throw new Error(`StoryGraph returned HTTP ${fetchRes.status} (possible Cloudflare block).`);
+      const retryDelays = Array.isArray(globalThis.__SG_FETCH_RETRY_DELAYS_MS)
+        ? globalThis.__SG_FETCH_RETRY_DELAYS_MS
+        : FETCH_RETRY_DELAYS_MS;
+      const maxAttempts = 1 + retryDelays.length;
+      let lastFetchErr = null;
+      let attempts = 0;
+
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        attempts = attempt;
+        try {
+          const fetchRes = await api.fetchToSd(url, dest, headers);
+          const st = fetchRes && typeof fetchRes.status === 'number' ? fetchRes.status : null;
+          if (st === 401) {
+            sessionVerified = false;
+            const err = new Error('StoryGraph returned HTTP 401 (session expired). Re-paste your cookies.');
+            err.status = 401;
+            throw err;
+          }
+          if (st === 403 || st === 503) {
+            const err = new Error(`StoryGraph returned HTTP ${st} (possible Cloudflare block).`);
+            err.status = st;
+            throw err;
+          }
+          if (fetchRes && fetchRes.error) {
+            const err = new Error(String(fetchRes.error));
+            if (st !== null) err.status = st;
+            throw err;
+          }
+          if (st !== null && (st < 200 || st >= 300)) {
+            const err = new Error(`StoryGraph fetch failed: HTTP ${st}`);
+            err.status = st;
+            throw err;
+          }
+          if (fetchRes && fetchRes.complete === false) {
+            throw new Error('Incomplete fetch response written to SD card.');
+          }
+          lastFetchErr = null;
+          break;
+        } catch (err) {
+          lastFetchErr = err;
+          if (attempt < maxAttempts && isTransientFetchError(err, null)) {
+            const delayMs = Number(retryDelays[attempt - 1]) || 0;
+            if (delayMs > 0) await sleepMs(delayMs);
+            continue;
+          }
+          const msg = String(err && err.message ? err.message : err);
+          if (attempts > 1 && !msg.includes('attempt')) {
+            const wrapped = new Error(`${msg} (after ${attempts} attempts)`);
+            if (err && err.status) wrapped.status = err.status;
+            throw wrapped;
+          }
+          throw err;
+        }
       }
+      if (lastFetchErr) {
+        throw lastFetchErr;
+      }
+
       const html = await readPluginText(FETCH_TMP_FILE);
       if (html === null) {
         throw new Error('Downloaded page could not be read back from SD card.');
@@ -3586,6 +3749,7 @@
             mapping.status = 'read';
             mapping.lastSyncedPercent = 100;
             mapping.lastSyncedAt = new Date().toISOString();
+            invalidateBookCleanupCache(mapping);
             await saveMapData();
             renderBooks();
             const msg = `"${row.title}" is already marked Read on StoryGraph.`;
@@ -3630,6 +3794,9 @@
           if (res.lastPostedPercent !== null && (mapping.lastSyncedPercent === null || mapping.lastSyncedPercent === undefined || res.lastPostedPercent > mapping.lastSyncedPercent)) {
             mapping.lastSyncedPercent = res.lastPostedPercent;
             mapping.lastSyncedAt = new Date().toISOString();
+            mapChanged = true;
+          }
+          if (res.posted > 0 && invalidateBookCleanupCache(mapping)) {
             mapChanged = true;
           }
           if (mapChanged) await saveMapData();
@@ -4045,6 +4212,7 @@
         if (otherInfo.status !== 'none') {
           pageInfo = otherInfo;
           mapping.bookId = otherInfo.bookId;
+          invalidateBookCleanupCache(mapping);
         }
       }
 
@@ -4068,6 +4236,7 @@
           mapping.status = 'read';
           mapping.lastSyncedPercent = 100;
           mapping.lastSyncedAt = new Date().toISOString();
+          invalidateBookCleanupCache(mapping);
           await saveMapData();
           if (opts.onStage) opts.onStage('syncing-dates');
           const dateRes = await syncBookDates(row, pageInfo, bookUrl);
@@ -4311,6 +4480,7 @@
       mapping.status = currentStatus;
       mapping.lastSyncedPercent = row.devicePercent;
       mapping.lastSyncedAt = new Date().toISOString();
+      invalidateBookCleanupCache(mapping);
       await saveMapData();
 
       if (opts.onStage) opts.onStage('syncing-dates');
@@ -4560,58 +4730,100 @@
         return;
       }
 
+      const pacingMs =
+        typeof globalThis.__SG_CLEAN_PACING_MS === 'number'
+          ? globalThis.__SG_CLEAN_PACING_MS
+          : CLEAN_JOURNALS_PACING_MS;
       const total = linkedRows.length;
       await runExclusive(`Scanning & cleaning journals (${total} book(s))...`, async () => {
-        let booksCleaned = 0;
+        let skipped = 0;
+        let verifiedClean = 0;
+        let booksModified = 0;
         let totalDeleted = 0;
         let totalUpdated = 0;
         let failed = 0;
         let lastError = '';
+        let fetchedCount = 0;
+        let mapDirty = false;
 
         setSyncProgress(0, `Cleaning Journals (0/${total})...`);
 
         for (let i = 0; i < total; i++) {
           const row = linkedRows[i];
-          if (i > 0) {
-            await sleepMs(300);
+          if (shouldSkipJournalCleanup(row, historyData)) {
+            skipped++;
+            const donePct = Math.round(((i + 1) / total) * 100);
+            setSyncProgress(donePct, `Skipped (cached clean) ${i + 1} of ${total} (${donePct}%) — "${row.title}"`);
+            continue;
           }
+          if (fetchedCount > 0 && pacingMs > 0) {
+            await sleepMs(pacingMs);
+          }
+          fetchedCount++;
           const pct = Math.round(((i + 0.3) / total) * 100);
           setSyncProgress(pct, `Scanning journal ${i + 1} of ${total} (${pct}%) — "${row.title}"...`);
           setBanner(`Scanning journal ${i + 1}/${total}: "${row.title}"...`, 'muted');
           try {
             const res = await cleanBookJournalCore(row);
             if (res.deleted > 0 || res.updated > 0) {
-              booksCleaned++;
+              booksModified++;
               totalDeleted += res.deleted;
               totalUpdated += res.updated;
+            } else {
+              verifiedClean++;
             }
+            stampBookCleanupVerified(row.mapping, historyData, row);
+            mapDirty = true;
             const donePct = Math.round(((i + 1) / total) * 100);
             const actLabel =
               res.deleted > 0 || res.updated > 0
                 ? `Cleaned (${res.deleted} deleted${res.updated ? ', ' + res.updated + ' repaired' : ''})`
-                : 'Clean';
+                : 'Verified clean';
             setSyncProgress(donePct, `${actLabel} ${i + 1} of ${total} (${donePct}%) — "${row.title}"`);
           } catch (err) {
             failed++;
             lastError = String(err && err.message ? err.message : err);
             const lower = lastError.toLowerCase();
-            if (lower.includes('expired') || lower.includes('cloudflare') || lower.includes('blocked')) {
+            if (
+              lower.includes('expired') ||
+              lower.includes('cloudflare') ||
+              lower.includes('blocked') ||
+              lower.includes('http 401') ||
+              lower.includes('http 403')
+            ) {
               break;
             }
           }
         }
 
+        if (mapDirty) {
+          try {
+            await saveMapData();
+          } catch (_) {}
+        }
+
+        const skipPart = skipped > 0 ? `, ${skipped} skipped` : '';
         if (failed > 0) {
+          const failPct = Math.min(99, Math.round(((skipped + verifiedClean + booksModified) / total) * 100));
+          setSyncProgress(
+            failPct,
+            `Journal cleanup finished: ${booksModified} modified, ${verifiedClean} verified clean${skipPart}, ${failed} failed`
+          );
           setBanner(
-            `Journal cleanup finished: ${totalDeleted} deleted, ${totalUpdated} repaired across ${booksCleaned} book(s), ${failed} failed (${lastError}).`,
+            `Journal cleanup finished: ${totalDeleted} deleted, ${totalUpdated} repaired across ${booksModified} modified, ${verifiedClean} verified clean${skipPart}, ${failed} failed (${lastError}).`,
             'err'
           );
         } else if (totalDeleted === 0 && totalUpdated === 0) {
-          setSyncProgress(100, `100% — All ${total} linked book journal(s) are already clean`);
-          setBanner(`All ${total} linked book journal(s) are already clean.`, 'muted');
+          const summary =
+            skipped > 0
+              ? `All ${total} linked book journal(s) are clean (${verifiedClean} verified clean, ${skipped} skipped).`
+              : `All ${total} linked book journal(s) are already clean (${verifiedClean} verified clean).`;
+          setSyncProgress(100, `100% — ${summary}`);
+          setBanner(summary, 'muted');
         } else {
           const repairNote = totalUpdated > 0 ? `, ${totalUpdated} Finished page credit(s) repaired` : '';
-          const msg = `Journal cleanup complete: ${totalDeleted} redundant/0% entry(s) deleted${repairNote} across ${booksCleaned} book(s).`;
+          const cleanPart = verifiedClean > 0 ? `, ${verifiedClean} verified clean` : '';
+          const msg = `Journal cleanup complete: ${totalDeleted} redundant/0% entry(s) deleted${repairNote} across ${booksModified} book(s)${cleanPart}${skipPart}.`;
           setSyncProgress(100, `100% — ${msg}`);
           setBanner(msg, 'ok');
         }
@@ -4662,6 +4874,7 @@
           mapping.status = 'read';
           mapping.lastSyncedPercent = 100;
           mapping.lastSyncedAt = new Date().toISOString();
+          invalidateBookCleanupCache(mapping);
           await saveMapData();
 
           setSyncProgress(88, `Syncing dates for "${row.title}"...`);
@@ -4815,6 +5028,20 @@
         const res = importSessionHistoryPayload(historyData, parsed, buildBookRows());
         historyData = res.history;
         await saveHistoryData();
+        if (res.importedSessions > 0) {
+          let mapInvalidated = false;
+          for (const row of buildBookRows()) {
+            if (
+              row &&
+              row.mapping &&
+              row.mapping.lastJournalCleanedWatermark &&
+              row.mapping.lastJournalCleanedWatermark !== computeBookJournalWatermark(historyData, row)
+            ) {
+              if (invalidateBookCleanupCache(row.mapping)) mapInvalidated = true;
+            }
+          }
+          if (mapInvalidated) await saveMapData();
+        }
         renderBooks();
         if (res.importedSessions > 0) {
           if (ta) ta.value = '';
@@ -5181,14 +5408,25 @@
               ? `<span class="sg-pill sg-pill-pending">${unsyncedHistCount} unsynced</span>`
               : '';
         const dayCount = isSyntheticOnly ? histItems.length : realHistDays.length;
-        const realSessCount = realHistSessions.filter((s) => s.recordType === 'reading_session').length;
+        const totalSessCount = realHistSessions.reduce(
+          (sum, s) =>
+            sum +
+            (s.recordType === 'reading_session'
+              ? 1
+              : s.recordType === 'legacy_daily_summary'
+                ? Math.max(1, s.legacySessionCount || 1)
+                : 0),
+          0
+        );
         const sessSummary = isSyntheticOnly
           ? row.sessions > 0
             ? ` · ${row.sessions} session${row.sessions === 1 ? '' : 's'}`
             : ''
-          : realSessCount > 0
-            ? ` · ${realSessCount} session${realSessCount === 1 ? '' : 's'}${totalDurLabel ? ' · ' + totalDurLabel + ' total' : ''}`
-            : '';
+          : totalSessCount > 0
+            ? ` · ${totalSessCount} session${totalSessCount === 1 ? '' : 's'}${totalDurLabel ? ' · ' + totalDurLabel + ' total' : ''}`
+            : totalDurLabel
+              ? ` · ${totalDurLabel} total`
+              : '';
         historyHtml =
           `<details class="sg-history" data-history-key="${escapeHtml(row.key)}"${historyOpenByKey[row.key] ? ' open' : ''}>` +
             `<summary class="sg-history-sum"><span>Reading history · ${dayCount} day${dayCount === 1 ? '' : 's'}${escapeHtml(sessSummary)}</span>${unsyncedBadge}</summary>` +
