@@ -769,7 +769,9 @@ export function createMockServer({ live = false } = {}) {
           if (pct > (b.lastReachedPercent || 0)) b.lastReachedPercent = pct;
           if (pgs > (b.lastReachedPages || 0)) b.lastReachedPages = pgs;
           b.journalEntries = b.journalEntries || [];
-          b.journalEntries.push({ date, percent: pct, pages: pgs, note });
+          b._nextJournalSeq = (b._nextJournalSeq || b.journalEntries.length) + 1;
+          const entryId = `je-post-${bid}-${b._nextJournalSeq}`;
+          b.journalEntries.push({ entryId, date, percent: pct, pages: pgs, pagesDelta: pgs, totalPages: b.pages || 0, note });
         }
         sgState.posts.push({
           path: '/update-progress-with-note',

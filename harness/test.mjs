@@ -2615,6 +2615,512 @@ async function runTests() {
     );
     assert.equal(sgState.books['book-mt-9'].journalEntries.length, 2, 'Only Started and Finished entries should remain');
     assert.equal(sgState.books['book-mt-9'].journalEntries[1].pagesDelta, 320, 'Finished entry should receive 320 pages credit');
+
+    // Case 11: All 15 Per-Session Reading Diary Acceptance Criteria (v3)
+    // Helper to build local Unix timestamps on 2026-11-22 at specific local hours/minutes
+    const localTs = (year, month, day, hour, minute, second = 0) =>
+      Math.floor(new Date(year, month - 1, day, hour, minute, second).getTime() / 1000);
+
+    const t0915 = localTs(2026, 11, 22, 9, 15, 0);
+    const t1340 = localTs(2026, 11, 22, 13, 40, 0);
+    const t2010 = localTs(2026, 11, 22, 20, 10, 0);
+
+    // Acceptance Test 1, 2, 3, 4:
+    // - Three sessions on one day (15s, 12m, 45m)
+    // - Two sessions with identical progress (32% -> 32%)
+    // - Two sessions with identical duration (15s and 15s)
+    // - 15-second session with 0% progress change (0% -> 0% and 32% -> 32%)
+    // - Test 9: Progress checkpoint without session (reader.exit advancing % with no reader.session)
+    const threeSessEvents = [
+      JSON.stringify({
+        e: 'reader.session',
+        id: 's-day-1',
+        ts: t0915 + 15,
+        vars: {
+          book: lawsPath,
+          start_time: String(t0915),
+          end_time: String(t0915 + 15),
+          duration_seconds: '15',
+          start_progress_bp: '3200',
+          end_progress_bp: '3200',
+          progress_scale: '10000'
+        }
+      }),
+      JSON.stringify({
+        e: 'reader.session',
+        id: 's-day-2',
+        ts: t1340 + 720,
+        vars: {
+          book: lawsPath,
+          start_time: String(t1340),
+          end_time: String(t1340 + 720),
+          duration_seconds: '720',
+          start_progress_bp: '3200',
+          end_progress_bp: '3500',
+          progress_scale: '10000'
+        }
+      }),
+      JSON.stringify({
+        e: 'reader.session',
+        id: 's-day-3',
+        ts: t2010 + 2700,
+        vars: {
+          book: lawsPath,
+          start_time: String(t2010),
+          end_time: String(t2010 + 2700),
+          duration_seconds: '2700',
+          start_progress_bp: '3500',
+          end_progress_bp: '4200',
+          progress_scale: '10000'
+        }
+      }),
+      JSON.stringify({
+        e: 'reader.exit',
+        id: 's-chk-4',
+        ts: t2010 + 3600,
+        vars: {
+          book: lawsPath,
+          percent: '45'
+        }
+      })
+    ].join('\n') + '\n';
+
+    const mergedThree = sg.mergeEventsIntoHistory({ version: 2, books: {} }, threeSessEvents);
+    const lawsSessions = Array.from(mergedThree.history.books[lawsPath].sessions);
+    assert.equal(lawsSessions.length, 4, 'Test 1 & 9: Expected 3 reading_session records + 1 progress_checkpoint');
+    assert.equal(lawsSessions[0].recordType, 'reading_session');
+    assert.equal(lawsSessions[0].durationSeconds, 15);
+    assert.equal(lawsSessions[0].startPercent, 32);
+    assert.equal(lawsSessions[0].endPercent, 32);
+    assert.equal(lawsSessions[1].recordType, 'reading_session');
+    assert.equal(lawsSessions[1].durationSeconds, 720);
+    assert.equal(lawsSessions[2].recordType, 'reading_session');
+    assert.equal(lawsSessions[2].durationSeconds, 2700);
+    assert.equal(lawsSessions[3].recordType, 'progress_checkpoint');
+    assert.equal(lawsSessions[3].endPercent, 45);
+    assert.equal(mergedThree.history.books[lawsPath].days['2026-11-22'].durationSeconds, 3435, 'Derived daily total must equal 57m 15s (3435s)');
+    assert.equal(mergedThree.history.books[lawsPath].days['2026-11-22'].sessions, 3);
+
+    // Test 4: 15-second session at 0% -> 0% on page 1 is preserved
+    const zeroPctSess = sg.mergeEventsIntoHistory(
+      { version: 2, books: {} },
+      JSON.stringify({
+        e: 'reader.session',
+        id: 's-zero-15s',
+        ts: t0915 + 15,
+        vars: {
+          book: lawsPath,
+          start_time: String(t0915),
+          end_time: String(t0915 + 15),
+          duration_seconds: '15',
+          start_progress_bp: '0',
+          end_progress_bp: '0',
+          progress_scale: '10000'
+        }
+      })
+    );
+    assert.equal(zeroPctSess.history.books[lawsPath].sessions.length, 1, 'Test 4: 15s session at 0% must be preserved');
+    assert.equal(zeroPctSess.history.books[lawsPath].sessions[0].durationSeconds, 15);
+    assert.equal(zeroPctSess.history.books[lawsPath].sessions[0].endPercent, 0);
+
+    // Test 8: Historical import with reordered & repeated identical records produces deterministic sessionIds and 0 duplicates
+    const impLineA = { title: 'Sample Non-Fiction A', started_at: '2026-11-20T09:00:00Z', ended_at: '2026-11-20T09:15:00Z', progress: 25, duration: 900 };
+    const impLineB = { title: 'Sample Non-Fiction A', started_at: '2026-11-20T14:00:00Z', ended_at: '2026-11-20T14:15:00Z', progress: 25, duration: 900 };
+    const impLineBClone = { title: 'Sample Non-Fiction A', started_at: '2026-11-20T14:00:00Z', ended_at: '2026-11-20T14:15:00Z', progress: 25, duration: 900 };
+    const knownRowsMock = [{ sdPath: lawsPath, title: 'Sample Non-Fiction A' }];
+    const impOrder1 = sg.importSessionHistoryPayload({ version: 2, books: {} }, [impLineA, impLineB, impLineBClone], knownRowsMock);
+    const impOrder2 = sg.importSessionHistoryPayload({ version: 2, books: {} }, [impLineB, impLineA, impLineBClone], knownRowsMock);
+    const idsOrder1 = Array.from(impOrder1.history.books[lawsPath].sessions, (s) => s.sessionId).sort();
+    const idsOrder2 = Array.from(impOrder2.history.books[lawsPath].sessions, (s) => s.sessionId).sort();
+    assert.equal(idsOrder1.length, 3, 'Test 8: Expected 3 sessions including 2 identical keyless records');
+    assert.deepEqual(idsOrder1, idsOrder2, 'Test 8: Reordering import file must yield identical deterministic sessionIds');
+    const reImp = sg.importSessionHistoryPayload(impOrder1.history, [impLineB, impLineA, impLineBClone], knownRowsMock);
+    assert.equal(reImp.history.books[lawsPath].sessions.length, 3, 'Test 8: Re-importing same records must create 0 duplicates');
+
+    // Test 14: Migration from v1 daily history creates legacy_daily_summary without inventing fake sessions
+    const migratedV1 = sg.cloneHistoryData({
+      version: 1,
+      books: {
+        [lawsPath]: {
+          days: {
+            '2026-11-10': {
+              date: '2026-11-10',
+              startPercent: 10,
+              endPercent: 30,
+              durationSeconds: 3435,
+              sessions: 3,
+              syncedToJournal: true,
+              seenIds: ['old-1', 'old-2', 'old-3']
+            }
+          }
+        }
+      }
+    });
+    assert.equal(migratedV1.books[lawsPath].sessions.length, 1, 'Test 14: v1 daily aggregate must migrate as 1 legacy_daily_summary');
+    assert.equal(migratedV1.books[lawsPath].sessions[0].recordType, 'legacy_daily_summary');
+    assert.equal(migratedV1.books[lawsPath].sessions[0].legacySessionCount, 3);
+
+    // Test 15: Session spanning midnight (23:40 Nov 21 -> 00:25 Nov 22)
+    const tMidStart = localTs(2026, 11, 21, 23, 40, 0);
+    const tMidEnd = localTs(2026, 11, 22, 0, 25, 0);
+    const midHist = sg.mergeEventsIntoHistory(
+      { version: 2, books: {} },
+      JSON.stringify({
+        e: 'reader.session',
+        id: 's-midnight',
+        ts: tMidEnd,
+        vars: {
+          book: lawsPath,
+          start_time: String(tMidStart),
+          end_time: String(tMidEnd),
+          duration_seconds: '2700',
+          start_progress_bp: '4000',
+          end_progress_bp: '5000',
+          progress_scale: '10000'
+        }
+      })
+    );
+    const midSess = midHist.history.books[lawsPath].sessions[0];
+    assert.equal(midSess.startDate, '2026-11-21', 'Test 15: Midnight session must record startDate on Day 1');
+    assert.equal(midSess.date, '2026-11-22', 'Test 15: Midnight session must assign canonical journal date on Day 2 (endTime)');
+    const midNote = sg.formatSessionJournalNote(midSess, true);
+    assert.equal(midNote, '23:40 (Nov 21)–00:25 · 45m read on X4 Pro', 'Test 15: Midnight note must show date crossover');
+
+    // Test 1, 2, 3, 5, 7, 11: End-to-end UI rendering & StoryGraph sync of multiple same-day sessions (including identical progress/duration & disabled notes)
+    sgState.books['book-daily-laws'].statusLabel = 'currently reading';
+    sgState.books['book-daily-laws'].progressType = 'percentage';
+    sgState.books['book-daily-laws'].lastReachedPercent = 32;
+    sgState.books['book-daily-laws'].lastReachedPages = 148;
+    sgState.books['book-daily-laws'].journalEntries = [];
+    sgState.posts.length = 0;
+
+    await mockApi.writeFile(
+      '/.crosspoint/plugins/storygraph-sync/reading-history.json',
+      Buffer.from(JSON.stringify({ version: 2, books: {} }), 'utf8').toString('base64')
+    );
+    await mockApi.writeFile(
+      '/.crosspoint/plugins/storygraph-sync/events.jsonl',
+      Buffer.from(threeSessEvents, 'utf8').toString('base64')
+    );
+    await mockApi.writeFile(
+      '/.crosspoint/plugins/storygraph-sync/storygraph-map.json',
+      Buffer.from(
+        JSON.stringify({
+          version: 1,
+          books: {
+            [lawsPath]: {
+              bookId: 'book-daily-laws',
+              title: 'Sample Non-Fiction A',
+              author: 'Author Alpha',
+              sdPath: lawsPath,
+              status: 'currently-reading',
+              lastSyncedPercent: 32
+            }
+          }
+        }),
+        'utf8'
+      ).toString('base64')
+    );
+    await refreshBtn.trigger('click');
+
+    const lawsDiaryDet = booksListEl
+      .querySelectorAll('details')
+      .find((d) => d.getAttribute('data-history-key') === lawsPath);
+    assert.ok(lawsDiaryDet, 'Expected Reading history details for 3 same-day sessions');
+    assert.ok(
+      lawsDiaryDet.textContent.includes('3 sessions') &&
+        lawsDiaryDet.textContent.includes('57m 15s total') &&
+        lawsDiaryDet.textContent.includes('Morning') &&
+        lawsDiaryDet.textContent.includes('Afternoon') &&
+        lawsDiaryDet.textContent.includes('Evening') &&
+        lawsDiaryDet.textContent.includes('Reading session 1') &&
+        lawsDiaryDet.textContent.includes('Reading session 2') &&
+        lawsDiaryDet.textContent.includes('Reading session 3') &&
+        lawsDiaryDet.textContent.includes('Progress checkpoint'),
+      `Expected session-level diary UI with Morning/Afternoon/Evening, 57m 15s total & Progress checkpoint, got "${lawsDiaryDet.textContent}"`
+    );
+
+    const lawsDiarySyncBtn = booksListEl
+      .querySelectorAll('button')
+      .find((b) => b.getAttribute('data-act') === 'sync-journal' && b.getAttribute('data-key') === lawsPath);
+    assert.ok(lawsDiarySyncBtn && lawsDiarySyncBtn.textContent.includes('Sync Journal (4)'));
+    await booksListEl.trigger('click', { target: lawsDiarySyncBtn });
+    await waitForLong(
+      () => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled && bannerEl.textContent.includes('Journal synced'),
+      'Expected 3 same-day sessions + 1 checkpoint to sync to StoryGraph'
+    );
+    const diaryPosts = sgState.posts.filter((p) => p.bid === 'book-daily-laws' && p.path === '/update-progress-with-note');
+    assert.equal(diaryPosts.length, 4, 'Test 1: All 3 same-day sessions + 1 progress checkpoint must be posted independently');
+    assert.equal(diaryPosts[0].note, '09:15 · 15s read on X4 Pro');
+    assert.equal(diaryPosts[1].note, '13:40–13:52 · 12m read on X4 Pro');
+    assert.equal(diaryPosts[2].note, '20:10–20:55 · 45m read on X4 Pro');
+
+    // Test 7: Repeated synchronization sends 0 duplicate POSTs
+    sgState.posts.length = 0;
+    await syncAllBtn.trigger('click');
+    await waitForLong(
+      () => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled,
+      'Expected repeated sync to finish'
+    );
+    assert.equal(
+      sgState.posts.filter((p) => p.bid === 'book-daily-laws' && p.path === '/update-progress-with-note').length,
+      0,
+      'Test 7: Repeated synchronization must post 0 duplicate journal entries'
+    );
+
+    // Test 5 & 11: Two identical sessions on the same day with duration notes disabled (empty notes) -> both posted, bound to distinct journalEntryIds, and both survive Clean Journals
+    journalNotesCheck.checked = false;
+    await journalNotesCheck.trigger('change');
+    sgState.books['book-daily-laws'].journalEntries = [];
+    sgState.posts.length = 0;
+
+    const twoIdenticalEmptyNoteEvents = [
+      JSON.stringify({
+        e: 'reader.session',
+        id: 's-ident-1',
+        ts: t0915 + 15,
+        vars: { book: lawsPath, duration_seconds: '15', start_progress_bp: '3200', end_progress_bp: '3200', progress_scale: '10000' }
+      }),
+      JSON.stringify({
+        e: 'reader.session',
+        id: 's-ident-2',
+        ts: t0915 + 45,
+        vars: { book: lawsPath, duration_seconds: '15', start_progress_bp: '3200', end_progress_bp: '3200', progress_scale: '10000' }
+      })
+    ].join('\n') + '\n';
+
+    await mockApi.writeFile(
+      '/.crosspoint/plugins/storygraph-sync/reading-history.json',
+      Buffer.from(JSON.stringify({ version: 2, books: {} }), 'utf8').toString('base64')
+    );
+    await mockApi.writeFile(
+      '/.crosspoint/plugins/storygraph-sync/events.jsonl',
+      Buffer.from(twoIdenticalEmptyNoteEvents, 'utf8').toString('base64')
+    );
+    await refreshBtn.trigger('click');
+    const identSyncBtn = booksListEl
+      .querySelectorAll('button')
+      .find((b) => b.getAttribute('data-act') === 'sync-journal' && b.getAttribute('data-key') === lawsPath);
+    await booksListEl.trigger('click', { target: identSyncBtn });
+    await waitForLong(
+      () => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled && bannerEl.textContent.includes('Journal synced'),
+      'Expected 2 identical empty-note sessions to sync'
+    );
+    const identPosts = sgState.posts.filter((p) => p.bid === 'book-daily-laws' && p.path === '/update-progress-with-note');
+    assert.equal(identPosts.length, 2, 'Test 2, 3, 5, 11: Both identical empty-note sessions must be posted');
+    assert.equal(identPosts[0].note, '');
+    assert.equal(identPosts[1].note, '');
+    const histAfterIdent = JSON.parse(virtualFiles.get('reading-history.json').toString('utf8'));
+    const ledgerSessions = histAfterIdent.books[lawsPath].sessions;
+    assert.equal(ledgerSessions.length, 2);
+    assert.ok(ledgerSessions[0].journalEntryId && ledgerSessions[1].journalEntryId);
+    assert.notEqual(ledgerSessions[0].journalEntryId, ledgerSessions[1].journalEntryId, 'Each identical session must bind a distinct journalEntryId');
+
+    await cleanJournalsBtn.trigger('click');
+    await waitForLong(
+      () => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled,
+      'Expected Clean Journals after identical empty-note sessions to finish'
+    );
+    assert.equal(
+      sgState.books['book-daily-laws'].journalEntries.length,
+      2,
+      'Test 5 & 11: Clean Journals must preserve both ledger-bound identical sessions even with empty notes'
+    );
+    journalNotesCheck.checked = true;
+    await journalNotesCheck.trigger('change');
+
+    // Test 6 & 12: Interrupted synchronization reconciliation (single match vs ambiguous multiple matches)
+    sgState.books['book-daily-laws'].journalEntries = [
+      { entryId: 'je-pre-1', date: '2026-11-22', percent: 30, pages: 139, note: '' },
+      { entryId: 'je-inflight-single', date: '2026-11-22', percent: 35, pages: 162, note: '12m read on X4 Pro' }
+    ];
+    await mockApi.writeFile(
+      '/.crosspoint/plugins/storygraph-sync/events.jsonl',
+      Buffer.from('\n', 'utf8').toString('base64')
+    );
+    await mockApi.writeFile(
+      '/.crosspoint/plugins/storygraph-sync/reading-history.json',
+      Buffer.from(
+        JSON.stringify({
+          version: 2,
+          books: {
+            [lawsPath]: {
+              sessions: [
+                {
+                  sessionId: 's-interrupted-1',
+                  recordType: 'reading_session',
+                  date: '2026-11-22',
+                  startPercent: 30,
+                  endPercent: 35,
+                  durationSeconds: 720,
+                  syncStatus: 'in_flight',
+                  syncedToJournal: false,
+                  prePostRemoteIds: ['je-pre-1']
+                }
+              ]
+            }
+          }
+        }),
+        'utf8'
+      ).toString('base64')
+    );
+    await refreshBtn.trigger('click');
+    sgState.posts.length = 0;
+    const recSingleBtn = booksListEl
+      .querySelectorAll('button')
+      .find((b) => b.getAttribute('data-act') === 'sync-journal' && b.getAttribute('data-key') === lawsPath);
+    await booksListEl.trigger('click', { target: recSingleBtn });
+    await waitForLong(
+      () => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled,
+      'Expected single-match in_flight reconciliation to complete'
+    );
+    assert.equal(
+      sgState.posts.filter((p) => p.bid === 'book-daily-laws' && p.path === '/update-progress-with-note').length,
+      0,
+      'Test 6: Single matching remote entry after interrupted sync must reconcile with 0 duplicate POSTs'
+    );
+    const histAfterSingleRec = JSON.parse(virtualFiles.get('reading-history.json').toString('utf8'));
+    assert.equal(histAfterSingleRec.books[lawsPath].sessions[0].syncStatus, 'synced');
+    assert.equal(histAfterSingleRec.books[lawsPath].sessions[0].journalEntryId, 'je-inflight-single');
+
+    // Test 12: Ambiguous multiple remote matches after interrupted sync -> flags needs_reconciliation without guessing or re-posting
+    sgState.books['book-daily-laws'].journalEntries = [
+      { entryId: 'je-pre-1', date: '2026-11-22', percent: 30, pages: 139, note: '' },
+      { entryId: 'je-ambig-a', date: '2026-11-22', percent: 40, pages: 186, note: '15m read on X4 Pro' },
+      { entryId: 'je-ambig-b', date: '2026-11-22', percent: 40, pages: 186, note: '15m read on X4 Pro' }
+    ];
+    await mockApi.writeFile(
+      '/.crosspoint/plugins/storygraph-sync/reading-history.json',
+      Buffer.from(
+        JSON.stringify({
+          version: 2,
+          books: {
+            [lawsPath]: {
+              sessions: [
+                {
+                  sessionId: 's-interrupted-ambig',
+                  recordType: 'reading_session',
+                  date: '2026-11-22',
+                  startPercent: 35,
+                  endPercent: 40,
+                  durationSeconds: 900,
+                  syncStatus: 'in_flight',
+                  syncedToJournal: false,
+                  prePostRemoteIds: ['je-pre-1']
+                }
+              ]
+            }
+          }
+        }),
+        'utf8'
+      ).toString('base64')
+    );
+    await refreshBtn.trigger('click');
+    sgState.posts.length = 0;
+    const recAmbigBtn = booksListEl
+      .querySelectorAll('button')
+      .find((b) => b.getAttribute('data-act') === 'sync-journal' && b.getAttribute('data-key') === lawsPath);
+    await booksListEl.trigger('click', { target: recAmbigBtn });
+    await waitForLong(
+      () => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled,
+      'Expected ambiguous in_flight reconciliation to complete'
+    );
+    assert.equal(
+      sgState.posts.filter((p) => p.bid === 'book-daily-laws' && p.path === '/update-progress-with-note').length,
+      0,
+      'Test 12: Ambiguous interrupted session must not re-post'
+    );
+    const histAfterAmbig = JSON.parse(virtualFiles.get('reading-history.json').toString('utf8'));
+    assert.equal(histAfterAmbig.books[lawsPath].sessions[0].syncStatus, 'needs_reconciliation');
+    assert.deepEqual(histAfterAmbig.books[lawsPath].sessions[0].candidateJournalEntryIds, ['je-ambig-a', 'je-ambig-b']);
+    assert.ok(booksListEl.textContent.includes('Needs reconciliation'), 'Test 12: UI must display Needs reconciliation badge');
+
+    // Test 10 & 13: Final 100% reading session with duration note is posted, retained alongside Read status, and preserved by Clean Journals
+    sgState.books['book-mt-9'].statusLabel = 'currently reading';
+    sgState.books['book-mt-9'].lastReachedPercent = 76;
+    sgState.books['book-mt-9'].lastReachedPages = 243;
+    sgState.books['book-mt-9'].journalEntries = [
+      { entryId: 'je-mt10-start', date: '2026-11-21', statusKind: 'started', isStatus: true },
+      { entryId: 'je-mt10-76', date: '2026-11-22', statusKind: null, isStatus: false, percent: 76, pages: 243, pagesDelta: 121, totalPages: 320, note: '40m read on X4 Pro' }
+    ];
+    sgState.posts.length = 0;
+    await mockApi.writeFile(
+      '/.crosspoint/plugins/storygraph-sync/reading-history.json',
+      Buffer.from(
+        JSON.stringify({
+          version: 2,
+          books: {
+            [mtPath]: {
+              sessions: [
+                {
+                  sessionId: 's-final-100',
+                  recordType: 'reading_session',
+                  date: '2026-11-22',
+                  startTime: t2010,
+                  endTime: t2010 + 2700,
+                  startPercent: 76,
+                  endPercent: 100,
+                  durationSeconds: 2700,
+                  syncStatus: 'pending',
+                  syncedToJournal: false
+                }
+              ]
+            }
+          }
+        }),
+        'utf8'
+      ).toString('base64')
+    );
+    await mockApi.writeFile(
+      '/.crosspoint/plugins/storygraph-sync/storygraph-map.json',
+      Buffer.from(
+        JSON.stringify({
+          version: 1,
+          books: {
+            [mtPath]: {
+              bookId: 'book-mt-9',
+              title: 'Sample Series Vol. 9',
+              author: 'Author Gamma',
+              sdPath: mtPath,
+              status: 'currently-reading',
+              lastSyncedPercent: 76
+            }
+          }
+        }),
+        'utf8'
+      ).toString('base64')
+    );
+    await refreshBtn.trigger('click');
+    const final100SyncBtn = booksListEl
+      .querySelectorAll('button')
+      .find((b) => b.getAttribute('data-act') === 'sync-journal' && b.getAttribute('data-key') === mtPath);
+    await booksListEl.trigger('click', { target: final100SyncBtn });
+    await waitForLong(
+      () => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled && sgState.books['book-mt-9'].statusLabel === 'read',
+      'Expected final 100% reading session to post and mark book Read'
+    );
+    const final100Posts = sgState.posts.filter((p) => p.bid === 'book-mt-9' && p.path === '/update-progress-with-note' && p.val === 100);
+    assert.equal(final100Posts.length, 1, 'Test 10: Genuine final 100% reading_session must be posted to StoryGraph journal');
+    assert.equal(final100Posts[0].note, '20:10–20:55 · 45m read on X4 Pro');
+
+    // Test 13: Even if StoryGraph also has a Finished status entry with duplicate pages, Clean Journals preserves the final 100% session and clears Finished duplicate page delta
+    sgState.books['book-mt-9'].journalEntries.push({
+      entryId: 'je-mt10-fin',
+      date: '2026-11-22',
+      statusKind: 'finished',
+      isStatus: true,
+      percent: 100,
+      pages: 320,
+      pagesDelta: 320,
+      totalPages: 320
+    });
+    const planFinal100 = sg.planJournalCleanup(sgState.books['book-mt-9'].journalEntries, {
+      claimedEntryIds: sg.collectClaimedJournalEntryIds(JSON.parse(virtualFiles.get('reading-history.json').toString('utf8')))
+    });
+    assert.equal(planFinal100.deletes.length, 0, 'Test 13: Clean Journals must never delete a genuine final 100% reading session');
+    assert.equal(planFinal100.updates.length, 1, 'Test 13: Clean Journals must clear duplicate page credit on Finished alongside genuine 100% sitting');
+    assert.equal(planFinal100.updates[0].entryId, 'je-mt10-fin');
+    assert.equal(planFinal100.updates[0].pagesRead, 0);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

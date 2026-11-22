@@ -676,14 +676,19 @@
     return params.toString();
   }
 
-  function planJournalCleanup(entries) {
+  function planJournalCleanup(entries, opts = {}) {
     const list = Array.isArray(entries) ? entries.filter((e) => e && e.entryId && e.date) : [];
+    const claimedSet =
+      opts && opts.claimedEntryIds instanceof Set
+        ? opts.claimedEntryIds
+        : new Set(Array.isArray(opts && opts.claimedEntryIds) ? opts.claimedEntryIds : []);
+    const hasZeroPctSession = Boolean(opts && opts.hasZeroPctSession);
     const updates = [];
     const deletes = [];
     const toDeleteIds = new Set();
 
     const markDelete = (entry, reason) => {
-      if (!entry || !entry.entryId || toDeleteIds.has(entry.entryId)) return;
+      if (!entry || !entry.entryId || toDeleteIds.has(entry.entryId) || claimedSet.has(entry.entryId)) return;
       toDeleteIds.add(entry.entryId);
       deletes.push({
         entryId: entry.entryId,
@@ -695,19 +700,39 @@
       });
     };
 
-    // Rule 1: Bogus 0% progress entries (!isStatus with 0% and 0 pages)
-    for (const e of list) {
+    const isGenuineFinalSession = (e) => {
+      if (!e || e.isStatus) return false;
+      if (e.entryId && claimedSet.has(e.entryId)) return true;
+      if (e.note && String(e.note).trim().length > 0) return true;
       if (
-        !e.isStatus &&
-        e.percent === 0 &&
-        (e.pages === 0 || e.pages === null) &&
-        (e.pagesDelta === 0 || e.pagesDelta === null)
+        e.pagesDelta !== null &&
+        e.pagesDelta !== undefined &&
+        e.pagesDelta > 0 &&
+        e.totalPages &&
+        e.pagesDelta < e.totalPages
       ) {
-        markDelete(e, '0% progress entry');
+        return true;
+      }
+      return false;
+    };
+
+    // Rule 1: Bogus 0% reset entries (un-ledgered, no note, 0% and 0 pages)
+    if (!hasZeroPctSession) {
+      for (const e of list) {
+        if (
+          !e.isStatus &&
+          !claimedSet.has(e.entryId) &&
+          !e.note &&
+          e.percent === 0 &&
+          (e.pages === 0 || e.pages === null) &&
+          (e.pagesDelta === 0 || e.pagesDelta === null)
+        ) {
+          markDelete(e, '0% progress entry');
+        }
       }
     }
 
-    // Rule 2: Stray 100% progress entries alongside a Finished status entry
+    // Rule 2: 100% progress entries alongside a Finished status entry
     const finishedEntries = list.filter((e) => e.statusKind === 'finished');
     const hundredProgressEntries = list.filter(
       (e) =>
@@ -717,66 +742,91 @@
     );
     if (finishedEntries.length > 0 && hundredProgressEntries.length > 0) {
       const fin = finishedEntries[finishedEntries.length - 1];
-      const strayWithPages = hundredProgressEntries.find((e) => (e.pagesDelta || 0) > 0);
-      if ((fin.pagesDelta === 0 || fin.pagesDelta === null) && strayWithPages) {
-        const totalPgs =
-          fin.totalPages ||
-          strayWithPages.totalPages ||
-          fin.pages ||
-          strayWithPages.pages ||
-          strayWithPages.pagesDelta;
-        updates.push({
-          entryId: fin.entryId,
-          date: fin.date,
-          pagesRead: strayWithPages.pagesDelta,
-          pagesReadTotal: totalPgs,
-          percentReached: 100,
-          note: fin.note || strayWithPages.note || '',
-          reason: 'transfer page credit to Finished entry'
-        });
-      }
-      for (const h of hundredProgressEntries) {
-        markDelete(h, 'duplicate 100% progress entry alongside Finished');
+      const genuineHundred = hundredProgressEntries.filter(isGenuineFinalSession);
+      const strayHundred = hundredProgressEntries.filter((e) => !isGenuineFinalSession(e));
+
+      if (genuineHundred.length > 0) {
+        // Genuine final reading session(s) exist: preserve them and prevent Finished from double-counting pages
+        if ((fin.pagesDelta || 0) > 0) {
+          const totalPgs =
+            fin.totalPages ||
+            genuineHundred[genuineHundred.length - 1].totalPages ||
+            fin.pages ||
+            genuineHundred[genuineHundred.length - 1].pages ||
+            0;
+          updates.push({
+            entryId: fin.entryId,
+            date: fin.date,
+            pagesRead: 0,
+            pagesReadTotal: totalPgs,
+            percentReached: 100,
+            note: fin.note || '',
+            reason: 'clear duplicate page credit on Finished alongside genuine final reading session'
+          });
+        }
+        for (const h of strayHundred) {
+          markDelete(h, 'duplicate 100% progress entry alongside Finished');
+        }
+      } else if (strayHundred.length > 0) {
+        const strayWithPages = strayHundred.find((e) => (e.pagesDelta || 0) > 0);
+        if ((fin.pagesDelta === 0 || fin.pagesDelta === null) && strayWithPages) {
+          const totalPgs =
+            fin.totalPages ||
+            strayWithPages.totalPages ||
+            fin.pages ||
+            strayWithPages.pages ||
+            strayWithPages.pagesDelta;
+          updates.push({
+            entryId: fin.entryId,
+            date: fin.date,
+            pagesRead: strayWithPages.pagesDelta,
+            pagesReadTotal: totalPgs,
+            percentReached: 100,
+            note: fin.note || strayWithPages.note || '',
+            reason: 'transfer page credit to Finished entry'
+          });
+        }
+        for (const h of strayHundred) {
+          markDelete(h, 'duplicate 100% progress entry alongside Finished');
+        }
       }
     }
 
-    // Rule 3: Same-day intermediate progress entry when Finished on that date already credits full book pages
+    // Rule 3: Same-day intermediate progress entry when Finished on that date credits full book pages
     for (const fin of finishedEntries) {
       const fullPages = fin.totalPages || fin.pages || 0;
       if (fullPages > 0 && fin.pagesDelta !== null && fin.pagesDelta >= fullPages) {
-        for (const e of list) {
-          if (
+        const sameDayIntermediates = list.filter(
+          (e) =>
             !e.isStatus &&
             !toDeleteIds.has(e.entryId) &&
             e.date === fin.date &&
-            (e.pagesDelta || 0) > 0
-          ) {
-            markDelete(e, 'same-day progress already credited in Finished entry');
+            (e.pagesDelta || 0) > 0 &&
+            (e.percent === null || e.percent < 100)
+        );
+        const genuineIntermediates = sameDayIntermediates.filter(
+          (e) => claimedSet.has(e.entryId) || Boolean(e.note && String(e.note).trim())
+        );
+        if (genuineIntermediates.length > 0) {
+          const lastGenuine = genuineIntermediates[genuineIntermediates.length - 1];
+          const reachedPages = lastGenuine.pages || lastGenuine.pagesDelta || 0;
+          const remainingDelta = Math.max(0, fullPages - reachedPages);
+          if (fin.pagesDelta !== remainingDelta && !updates.some((u) => u.entryId === fin.entryId)) {
+            updates.push({
+              entryId: fin.entryId,
+              date: fin.date,
+              pagesRead: remainingDelta,
+              pagesReadTotal: fullPages,
+              percentReached: 100,
+              note: fin.note || '',
+              reason: 'adjust Finished sitting delta to preserve same-day intermediate session'
+            });
           }
         }
-      }
-    }
-
-    // Rule 4: Exact same-day duplicate progress entries (same date, percent, and pages)
-    const groups = new Map();
-    for (const e of list) {
-      if (e.isStatus || toDeleteIds.has(e.entryId)) continue;
-      const key = `${e.date}|${e.percent ?? ''}|${e.pages ?? ''}`;
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push(e);
-    }
-    for (const group of groups.values()) {
-      if (group.length <= 1) continue;
-      let keepIdx = group.length - 1;
-      for (let i = group.length - 1; i >= 0; i--) {
-        if (group[i].note) {
-          keepIdx = i;
-          break;
-        }
-      }
-      for (let i = 0; i < group.length; i++) {
-        if (i !== keepIdx) {
-          markDelete(group[i], 'duplicate same-day progress entry');
+        for (const e of sameDayIntermediates) {
+          if (!claimedSet.has(e.entryId) && !(e.note && String(e.note).trim())) {
+            markDelete(e, 'same-day progress already credited in Finished entry');
+          }
         }
       }
     }
@@ -813,96 +863,430 @@
     return params.toString();
   }
 
+  function formatLocalClockFromTs(tsSeconds) {
+    const n = toFiniteNumber(tsSeconds);
+    if (n === null || n <= 0) return '';
+    const d = new Date(n * 1000);
+    if (!Number.isFinite(d.getTime())) return '';
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  }
+
+  function getTimeOfDayPeriodFromTs(tsSeconds) {
+    const n = toFiniteNumber(tsSeconds);
+    if (n === null || n <= 0) return '';
+    const d = new Date(n * 1000);
+    if (!Number.isFinite(d.getTime())) return '';
+    const h = d.getHours();
+    if (h >= 5 && h < 12) return 'Morning';
+    if (h >= 12 && h < 17) return 'Afternoon';
+    if (h >= 17 && h < 21) return 'Evening';
+    return 'Night';
+  }
+
+  function formatShortMonthDay(isoDate) {
+    const parts = parseIsoDateParts(isoDate);
+    if (!parts) return '';
+    const shortMonths = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    return `${shortMonths[parts.month - 1]} ${parts.day}`;
+  }
+
+  function formatDurationLabel(sec) {
+    const s = Math.round(Number(sec) || 0);
+    if (s <= 0) return '';
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    const remS = s % 60;
+    if (m < 60) return remS > 0 ? `${m}m ${remS}s` : `${m}m`;
+    const h = Math.floor(m / 60);
+    const remM = m % 60;
+    return `${h}h ${remM}m`;
+  }
+
+  function formatSessionTimeRangeLabel(session) {
+    if (!session) return '';
+    const startClock = formatLocalClockFromTs(session.startTime);
+    const endClock = formatLocalClockFromTs(session.endTime);
+    if (!startClock && !endClock) return '';
+    const startIso = session.startDate || (session.startTime ? localIsoDateFromTs(session.startTime) : '');
+    const endIso = session.date || (session.endTime ? localIsoDateFromTs(session.endTime) : '');
+    if (startClock && endClock) {
+      if (startIso && endIso && startIso !== endIso) {
+        return `${startClock} (${formatShortMonthDay(startIso)})–${endClock}`;
+      }
+      if (startClock !== endClock) {
+        return `${startClock}–${endClock}`;
+      }
+    }
+    return startClock || endClock;
+  }
+
+  function formatSessionJournalNote(session, includeDurationNotes) {
+    if (!includeDurationNotes || !session) return '';
+    const durStr = formatDurationLabel(session.durationSeconds);
+    const rangeStr = formatSessionTimeRangeLabel(session);
+    if (rangeStr && durStr) {
+      return `${rangeStr} · ${durStr} read on X4 Pro`;
+    }
+    if (durStr) {
+      return `${durStr} read on X4 Pro`;
+    }
+    if (rangeStr) {
+      return `${rangeStr} · read on X4 Pro`;
+    }
+    return '';
+  }
+
+  function compareSessionRecords(a, b) {
+    const aStart = a.startTime ?? a.endTime ?? a.sortTs ?? 0;
+    const bStart = b.startTime ?? b.endTime ?? b.sortTs ?? 0;
+    const aDate = String(a.date || '');
+    const bDate = String(b.date || '');
+    if (aStart > 0 && bStart > 0 && aStart !== bStart) {
+      return aStart - bStart;
+    }
+    if (aDate !== bDate) {
+      return aDate.localeCompare(bDate);
+    }
+    const aEnd = a.endTime ?? a.startTime ?? a.sortTs ?? 0;
+    const bEnd = b.endTime ?? b.startTime ?? b.sortTs ?? 0;
+    if (aEnd !== bEnd) {
+      return aEnd - bEnd;
+    }
+    return String(a.sessionId || '').localeCompare(String(b.sessionId || ''));
+  }
+
+  function normalizeSessionRecord(raw, fallbackIdx = 0) {
+    if (!raw || typeof raw !== 'object') return null;
+    const endTime = toFiniteNumber(raw.endTime ?? raw.end_time);
+    const startTime = toFiniteNumber(raw.startTime ?? raw.start_time);
+    const sortTs = toFiniteNumber(raw.sortTs ?? raw.ts) ?? endTime ?? startTime ?? null;
+    const dateParts = parseIsoDateParts(raw.date);
+    const date = (dateParts && dateParts.iso) || localIsoDateFromTs(endTime ?? sortTs ?? startTime);
+    if (!date) return null;
+    const startDateParts = parseIsoDateParts(raw.startDate);
+    const startDate =
+      (startDateParts && startDateParts.iso) ||
+      (startTime !== null ? localIsoDateFromTs(startTime) || date : date);
+    const recordType =
+      raw.recordType === 'progress_checkpoint' ||
+      raw.recordType === 'legacy_daily_summary' ||
+      raw.recordType === 'reading_session'
+        ? raw.recordType
+        : 'reading_session';
+    const durationSeconds = Math.max(0, Math.round(toFiniteNumber(raw.durationSeconds ?? raw.duration_seconds) || 0));
+    const startProgressBp = toFiniteNumber(raw.startProgressBp ?? raw.start_progress_bp);
+    const endProgressBp = toFiniteNumber(raw.endProgressBp ?? raw.end_progress_bp);
+    const progressScale = toFiniteNumber(raw.progressScale ?? raw.progress_scale) || 10000;
+    let startPercent = toFiniteNumber(raw.startPercent);
+    if (startPercent === null && startProgressBp !== null) {
+      startPercent = Math.max(0, Math.min(100, Math.round((startProgressBp / progressScale) * 100)));
+    }
+    let endPercent = toFiniteNumber(raw.endPercent);
+    if (endPercent === null && endProgressBp !== null) {
+      const rawPct = Math.round((endProgressBp / progressScale) * 100);
+      endPercent = endProgressBp > 0 ? Math.max(1, Math.min(100, rawPct)) : 0;
+    }
+    const synced = Boolean(raw.syncedToJournal || raw.syncStatus === 'synced');
+    const syncStatus =
+      raw.syncStatus === 'in_flight' || raw.syncStatus === 'needs_reconciliation'
+        ? raw.syncStatus
+        : synced
+          ? 'synced'
+          : 'pending';
+    const sessionId = String(raw.sessionId || raw.id || `sess:${date}:${fallbackIdx}`);
+    return {
+      sessionId,
+      id: sessionId,
+      recordType,
+      date,
+      startDate,
+      startTime,
+      endTime,
+      sortTs,
+      durationSeconds,
+      startProgressBp,
+      endProgressBp,
+      progressScale,
+      startPercent,
+      endPercent,
+      legacySessionCount: toFiniteNumber(raw.legacySessionCount ?? raw.sessions) || 0,
+      seenIds: Array.isArray(raw.seenIds) ? raw.seenIds.map(String).slice(-40) : [sessionId],
+      syncStatus,
+      journalEntryId: raw.journalEntryId ? String(raw.journalEntryId) : null,
+      syncedToJournal: syncStatus === 'synced',
+      prePostRemoteIds: Array.isArray(raw.prePostRemoteIds) ? raw.prePostRemoteIds.map(String) : null,
+      candidateJournalEntryIds: Array.isArray(raw.candidateJournalEntryIds)
+        ? raw.candidateJournalEntryIds.map(String)
+        : null
+    };
+  }
+
+  function rebuildDerivedDaysForBook(bookRec) {
+    if (!bookRec || typeof bookRec !== 'object') return;
+    const sessions = Array.isArray(bookRec.sessions) ? bookRec.sessions : [];
+    sessions.sort(compareSessionRecords);
+    const days = {};
+    for (const s of sessions) {
+      if (!s || !s.date) continue;
+      if (
+        s.recordType !== 'reading_session' &&
+        (s.endPercent === null || s.endPercent === undefined || s.endPercent <= 0) &&
+        !(s.durationSeconds > 0) &&
+        !s.syncedToJournal
+      ) {
+        continue;
+      }
+      if (!days[s.date]) {
+        days[s.date] = {
+          date: s.date,
+          startPercent: s.startPercent ?? null,
+          endPercent: s.endPercent ?? null,
+          durationSeconds: 0,
+          sessions: 0,
+          syncedToJournal: true,
+          seenIds: []
+        };
+      }
+      const d = days[s.date];
+      if (s.startPercent !== null && s.startPercent !== undefined) {
+        if (d.startPercent === null || s.startPercent < d.startPercent) {
+          d.startPercent = s.startPercent;
+        }
+      }
+      if (s.endPercent !== null && s.endPercent !== undefined) {
+        if (d.endPercent === null || s.endPercent > d.endPercent) {
+          d.endPercent = s.endPercent;
+        }
+      }
+      d.durationSeconds += s.durationSeconds || 0;
+      if (s.recordType === 'legacy_daily_summary') {
+        d.sessions += Math.max(1, s.legacySessionCount || 1);
+      } else if (s.recordType === 'reading_session') {
+        d.sessions += 1;
+      }
+      if (!s.syncedToJournal && s.syncStatus !== 'synced') {
+        d.syncedToJournal = false;
+      }
+      for (const sid of s.seenIds || [s.sessionId]) {
+        if (sid && !d.seenIds.includes(sid)) {
+          d.seenIds.push(sid);
+        }
+      }
+      if (d.seenIds.length > 40) d.seenIds = d.seenIds.slice(-40);
+    }
+    bookRec.days = days;
+  }
+
   function cloneHistoryData(historyData) {
-    const out = { version: 1, books: {} };
+    const out = { version: 2, books: {} };
     const srcBooks = historyData && historyData.books && typeof historyData.books === 'object' ? historyData.books : {};
     for (const [sdPath, rec] of Object.entries(srcBooks)) {
       if (!rec || typeof rec !== 'object') continue;
-      const days = {};
-      for (const [dateKey, d] of Object.entries(rec.days || {})) {
-        if (!d || typeof d !== 'object') continue;
-        days[dateKey] = {
-          date: String(d.date || dateKey),
-          startPercent: toFiniteNumber(d.startPercent),
-          endPercent: toFiniteNumber(d.endPercent),
-          durationSeconds: toFiniteNumber(d.durationSeconds) || 0,
-          sessions: toFiniteNumber(d.sessions) || 0,
-          syncedToJournal: Boolean(d.syncedToJournal),
-          seenIds: Array.isArray(d.seenIds) ? d.seenIds.slice(-40) : []
-        };
+      const sessions = [];
+      const bySessionId = new Map();
+      const coveredDates = new Map();
+      const realSessionSeenIds = new Set();
+
+      if (Array.isArray(rec.sessions)) {
+        for (let i = 0; i < rec.sessions.length; i++) {
+          const norm = normalizeSessionRecord(rec.sessions[i], i + 1);
+          if (!norm) continue;
+          if (bySessionId.has(norm.sessionId)) continue;
+          bySessionId.set(norm.sessionId, norm);
+          sessions.push(norm);
+          if (!coveredDates.has(norm.date)) coveredDates.set(norm.date, []);
+          coveredDates.get(norm.date).push(norm);
+          if (norm.recordType !== 'legacy_daily_summary') {
+            realSessionSeenIds.add(norm.sessionId);
+            for (const sid of norm.seenIds || []) realSessionSeenIds.add(sid);
+          }
+        }
       }
-      out.books[sdPath] = { days };
+
+      if (rec.days && typeof rec.days === 'object') {
+        for (const [dateKey, d] of Object.entries(rec.days)) {
+          if (!d || typeof d !== 'object') continue;
+          const iso = String(d.date || dateKey);
+          if (!iso) continue;
+          const existingForDate = coveredDates.get(iso) || [];
+          const dEndPct = toFiniteNumber(d.endPercent);
+          const dDur = toFiniteNumber(d.durationSeconds) || 0;
+          const dSynced = Boolean(d.syncedToJournal);
+          if (existingForDate.length > 0) {
+            const maxSessPct = existingForDate.reduce(
+              (acc, s) => (s.endPercent !== null && (acc === null || s.endPercent > acc) ? s.endPercent : acc),
+              null
+            );
+            if (!dSynced && existingForDate.every((s) => s.syncedToJournal)) {
+              for (const s of existingForDate) {
+                s.syncedToJournal = false;
+                s.syncStatus = 'pending';
+                s.journalEntryId = null;
+              }
+            } else if (dSynced && existingForDate.some((s) => !s.syncedToJournal && s.syncStatus === 'pending')) {
+              for (const s of existingForDate) {
+                if (s.syncStatus === 'pending') {
+                  s.syncedToJournal = true;
+                  s.syncStatus = 'synced';
+                }
+              }
+            }
+            if (dEndPct !== null && (maxSessPct === null || dEndPct > maxSessPct)) {
+              const legId = `legacy:${iso}:${dEndPct}`;
+              if (!bySessionId.has(legId)) {
+                const leg = normalizeSessionRecord({
+                  sessionId: legId,
+                  recordType: 'legacy_daily_summary',
+                  date: iso,
+                  startPercent: toFiniteNumber(d.startPercent),
+                  endPercent: dEndPct,
+                  durationSeconds: dDur,
+                  legacySessionCount: toFiniteNumber(d.sessions) || 1,
+                  seenIds: Array.isArray(d.seenIds) ? d.seenIds : [],
+                  syncedToJournal: dSynced
+                });
+                if (leg) {
+                  bySessionId.set(leg.sessionId, leg);
+                  sessions.push(leg);
+                }
+              }
+            }
+            continue;
+          }
+          if ((dEndPct === null || dEndPct <= 0) && !(dDur > 0) && !dSynced) {
+            continue;
+          }
+          const leg = normalizeSessionRecord({
+            sessionId: `legacy:${iso}`,
+            recordType: 'legacy_daily_summary',
+            date: iso,
+            startPercent: toFiniteNumber(d.startPercent),
+            endPercent: dEndPct,
+            durationSeconds: dDur,
+            legacySessionCount: toFiniteNumber(d.sessions) || (dDur > 0 ? 1 : 0),
+            seenIds: Array.isArray(d.seenIds) ? d.seenIds : [],
+            syncedToJournal: dSynced
+          });
+          if (leg && !bySessionId.has(leg.sessionId)) {
+            bySessionId.set(leg.sessionId, leg);
+            sessions.push(leg);
+          }
+        }
+      }
+
+      // Filter out legacy_daily_summary records that have been superseded by real individual sessions covering their seenIds
+      const filteredSessions = sessions.filter((s) => {
+        if (s.recordType !== 'legacy_daily_summary') return true;
+        const nonLegacyIds = (s.seenIds || []).filter((id) => !String(id).startsWith('legacy:'));
+        if (nonLegacyIds.length > 0 && nonLegacyIds.every((id) => realSessionSeenIds.has(id))) {
+          return false;
+        }
+        return true;
+      });
+
+      const bookRec = { sessions: filteredSessions, days: {} };
+      rebuildDerivedDaysForBook(bookRec);
+      if (bookRec.sessions.length > 0 || Object.keys(bookRec.days).length > 0) {
+        out.books[sdPath] = bookRec;
+      }
     }
     return out;
   }
 
-  function mergeHistoryDaySample(history, sdPath, { date, startPercent, endPercent, durationSeconds, isSession, eventId, isCompact }) {
-    if (!sdPath || !date) return false;
+  function upsertHistorySessionRecord(history, sdPath, rawSession) {
+    if (!sdPath || !rawSession) return false;
+    const norm = normalizeSessionRecord(rawSession);
+    if (!norm) return false;
+    if (
+      norm.recordType !== 'reading_session' &&
+      (norm.endPercent === null || norm.endPercent <= 0) &&
+      !(norm.durationSeconds > 0) &&
+      !norm.syncedToJournal
+    ) {
+      return false;
+    }
+
     let changed = false;
     if (!history.books[sdPath]) {
-      history.books[sdPath] = { days: {} };
+      history.books[sdPath] = { sessions: [], days: {} };
       changed = true;
     }
-    const days = history.books[sdPath].days;
-    if (!days[date]) {
-      days[date] = {
-        date,
-        startPercent: null,
-        endPercent: null,
-        durationSeconds: 0,
-        sessions: 0,
-        syncedToJournal: false,
-        seenIds: []
-      };
+    const bookRec = history.books[sdPath];
+    if (!Array.isArray(bookRec.sessions)) {
+      bookRec.sessions = [];
       changed = true;
     }
-    const day = days[date];
-    const endPct = toFiniteNumber(endPercent);
-    const startPct = toFiniteNumber(startPercent);
-    const dur = Math.max(0, Math.round(toFiniteNumber(durationSeconds) || 0));
 
-    if (endPct !== null && (day.endPercent === null || endPct > day.endPercent)) {
-      day.endPercent = endPct;
-      day.syncedToJournal = false;
-      changed = true;
-    }
-    if (startPct !== null && (day.startPercent === null || startPct < day.startPercent)) {
-      day.startPercent = startPct;
-      changed = true;
-    }
-    if (eventId && !isCompact) {
-      if (!day.seenIds.includes(eventId)) {
-        day.seenIds.push(eventId);
-        if (day.seenIds.length > 40) day.seenIds = day.seenIds.slice(-40);
-        if (dur > 0) day.durationSeconds += dur;
-        if (isSession) day.sessions += 1;
+    const existing = bookRec.sessions.find(
+      (s) => s.sessionId === norm.sessionId || (norm.sessionId && (s.seenIds || []).includes(norm.sessionId) && s.recordType !== 'legacy_daily_summary')
+    );
+    if (existing) {
+      if (norm.endPercent !== null && (existing.endPercent === null || norm.endPercent > existing.endPercent)) {
+        existing.endPercent = norm.endPercent;
         changed = true;
       }
-    } else if (dur > day.durationSeconds) {
-      day.durationSeconds = dur;
-      changed = true;
+      if (norm.startPercent !== null && existing.startPercent === null) {
+        existing.startPercent = norm.startPercent;
+        changed = true;
+      }
+      if (norm.durationSeconds > existing.durationSeconds) {
+        existing.durationSeconds = norm.durationSeconds;
+        changed = true;
+      }
+      if (norm.startTime !== null && existing.startTime === null) {
+        existing.startTime = norm.startTime;
+        existing.startDate = norm.startDate;
+        changed = true;
+      }
+      if (norm.endTime !== null && existing.endTime === null) {
+        existing.endTime = norm.endTime;
+        changed = true;
+      }
+      if (changed) rebuildDerivedDaysForBook(bookRec);
+      return changed;
     }
-    return changed;
+
+    // If a legacy_daily_summary had this sessionId in seenIds, remove that seenId (and remove the legacy summary if all seenIds are now real sessions)
+    for (let i = bookRec.sessions.length - 1; i >= 0; i--) {
+      const s = bookRec.sessions[i];
+      if (s.recordType === 'legacy_daily_summary' && Array.isArray(s.seenIds) && s.seenIds.includes(norm.sessionId)) {
+        s.seenIds = s.seenIds.filter((id) => id !== norm.sessionId && !String(id).startsWith('legacy:'));
+        if (s.seenIds.length === 0) {
+          bookRec.sessions.splice(i, 1);
+        }
+        changed = true;
+      }
+    }
+
+    bookRec.sessions.push(norm);
+    rebuildDerivedDaysForBook(bookRec);
+    return true;
   }
 
   function mergeEventsIntoHistory(historyData, jsonlText) {
     const history = cloneHistoryData(historyData);
-    let changed = false;
+    const srcBookKeys =
+      historyData && historyData.books && typeof historyData.books === 'object'
+        ? Object.keys(historyData.books)
+        : [];
+    let changed = srcBookKeys.some((k) => !history.books[k]);
 
     for (const [bookPath, rec] of Object.entries(history.books)) {
-      if (!rec || !rec.days || typeof rec.days !== 'object') continue;
-      for (const [dateKey, d] of Object.entries(rec.days)) {
-        if (
-          d &&
-          (d.endPercent === null || d.endPercent === undefined || d.endPercent <= 0) &&
-          !(d.durationSeconds > 0) &&
-          !d.syncedToJournal
-        ) {
-          delete rec.days[dateKey];
-          changed = true;
-        }
+      if (!rec) continue;
+      const beforeLen = Array.isArray(rec.sessions) ? rec.sessions.length : 0;
+      rec.sessions = (rec.sessions || []).filter(
+        (s) =>
+          s &&
+          (s.recordType === 'reading_session' ||
+            (s.endPercent !== null && s.endPercent !== undefined && s.endPercent > 0) ||
+            (s.durationSeconds || 0) > 0 ||
+            s.syncedToJournal)
+      );
+      if (rec.sessions.length !== beforeLen) {
+        rebuildDerivedDaysForBook(rec);
+        changed = true;
       }
-      if (Object.keys(rec.days).length === 0) {
+      if (rec.sessions.length === 0) {
         delete history.books[bookPath];
         changed = true;
       }
@@ -924,34 +1308,139 @@
       const sdPath = vars.book || vars.path || vars.book_path || vars.sdPath;
       if (!sdPath || typeof sdPath !== 'string') continue;
 
-      const ts = toFiniteNumber(ev.ts) ?? toFiniteNumber(vars.end_time) ?? toFiniteNumber(vars.start_time);
-      const date = localIsoDateFromTs(ts);
+      const startTime = toFiniteNumber(vars.start_time) ?? toFiniteNumber(ev.start_time);
+      const endTime = toFiniteNumber(vars.end_time) ?? toFiniteNumber(ev.end_time);
+      const evTs = toFiniteNumber(ev.ts);
+      const canonicalTs = endTime ?? evTs ?? startTime;
+      const date = localIsoDateFromTs(canonicalTs);
       if (!date) continue;
+      const startDate = startTime !== null ? localIsoDateFromTs(startTime) || date : date;
 
       const endPct = computePercentFromVars(vars);
-      let startPct = null;
+      let startPct = toFiniteNumber(vars.start_percent ?? vars.startPercent);
       const startBp = toFiniteNumber(vars.start_progress_bp);
-      if (startBp !== null) {
-        const scaleRaw = toFiniteNumber(vars.progress_scale);
-        const scale = scaleRaw && scaleRaw > 0 ? scaleRaw : 10000;
+      const endBp = toFiniteNumber(vars.end_progress_bp);
+      const scaleRaw = toFiniteNumber(vars.progress_scale);
+      const scale = scaleRaw && scaleRaw > 0 ? scaleRaw : 10000;
+      if (startPct === null && startBp !== null) {
         startPct = Math.max(0, Math.min(100, Math.round((startBp / scale) * 100)));
       }
-      const dur = toFiniteNumber(vars.duration_seconds) || 0;
-      if ((endPct === null || endPct <= 0) && dur <= 0) continue;
-
+      const dur = Math.max(0, Math.round(toFiniteNumber(vars.duration_seconds) || 0));
       const evId = ev.id ? String(ev.id) : '';
       const isCompact = evId.startsWith('compact-');
       const isSession = (ev.e || ev.event) === 'reader.session';
 
+      if (!isSession && (endPct === null || endPct <= 0) && dur <= 0) continue;
+      if (isSession && (endPct === null || endPct < 0) && dur <= 0 && startBp === null && endBp === null) continue;
+
+      const bookRec = history.books[sdPath];
+      const existingSessions = bookRec && Array.isArray(bookRec.sessions) ? bookRec.sessions : [];
+
+      if (isCompact) {
+        // Compact snapshot: only create/update a record if history has no record on or reaching this snapshot
+        const maxPct = existingSessions.reduce(
+          (acc, s) => (s.endPercent !== null && (acc === null || s.endPercent > acc) ? s.endPercent : acc),
+          null
+        );
+        if (existingSessions.length > 0 && maxPct !== null && (endPct === null || maxPct >= endPct)) {
+          const sameDateSess = existingSessions.filter((s) => s.date === date);
+          if (sameDateSess.length === 1 && dur > (sameDateSess[0].durationSeconds || 0)) {
+            sameDateSess[0].durationSeconds = dur;
+            rebuildDerivedDaysForBook(bookRec);
+            changed = true;
+          }
+          continue;
+        }
+        const compactId = evId || `compact:${date}:${endPct ?? 0}`;
+        if (
+          upsertHistorySessionRecord(history, sdPath, {
+            sessionId: compactId,
+            recordType: dur > 0 ? 'reading_session' : 'progress_checkpoint',
+            date,
+            startDate,
+            startTime,
+            endTime,
+            sortTs: canonicalTs,
+            durationSeconds: dur,
+            startProgressBp: startBp,
+            endProgressBp: endBp,
+            progressScale: scale,
+            startPercent: startPct,
+            endPercent: endPct
+          })
+        ) {
+          changed = true;
+        }
+        continue;
+      }
+
+      if (!isSession) {
+        // Companion reader.exit check: if a reading_session from the same sitting already exists, attach seenId instead of duplicating
+        const evPrefix = evId.includes('-') ? evId.split('-')[0] : '';
+        const companion = existingSessions.find(
+          (s) =>
+            s.recordType === 'reading_session' &&
+            ((evId && (s.seenIds || []).includes(evId)) ||
+              (canonicalTs !== null && (s.endTime === canonicalTs || s.sortTs === canonicalTs) && s.endPercent === endPct) ||
+              (evPrefix && String(s.sessionId || '').startsWith(evPrefix + '-') && s.date === date && s.endPercent === endPct))
+        );
+        if (companion) {
+          if (evId && !companion.seenIds.includes(evId)) {
+            companion.seenIds.push(evId);
+            rebuildDerivedDaysForBook(bookRec);
+            changed = true;
+          }
+          continue;
+        }
+        const maxPct = existingSessions.reduce(
+          (acc, s) => (s.endPercent !== null && (acc === null || s.endPercent > acc) ? s.endPercent : acc),
+          null
+        );
+        if (endPct !== null && maxPct !== null && endPct <= maxPct && dur <= 0) {
+          continue;
+        }
+        const chkId = evId || `chk:${date}:${canonicalTs || 0}:${endPct ?? 0}`;
+        if (
+          upsertHistorySessionRecord(history, sdPath, {
+            sessionId: chkId,
+            recordType: 'progress_checkpoint',
+            date,
+            startDate,
+            startTime: null,
+            endTime: null,
+            sortTs: canonicalTs,
+            durationSeconds: dur,
+            startProgressBp: startBp,
+            endProgressBp: endBp,
+            progressScale: scale,
+            startPercent: startPct !== null ? startPct : maxPct,
+            endPercent: endPct
+          })
+        ) {
+          changed = true;
+        }
+        continue;
+      }
+
+      // Actual reader.session sitting
+      const sessId =
+        evId ||
+        `sess:${startTime ?? canonicalTs ?? date}:${endTime ?? ''}:${dur}:${startBp ?? startPct ?? ''}:${endBp ?? endPct ?? ''}`;
       if (
-        mergeHistoryDaySample(history, sdPath, {
+        upsertHistorySessionRecord(history, sdPath, {
+          sessionId: sessId,
+          recordType: 'reading_session',
           date,
-          startPercent: startPct,
-          endPercent: endPct,
+          startDate,
+          startTime,
+          endTime,
+          sortTs: canonicalTs,
           durationSeconds: dur,
-          isSession,
-          eventId: evId,
-          isCompact
+          startProgressBp: startBp,
+          endProgressBp: endBp,
+          progressScale: scale,
+          startPercent: startPct,
+          endPercent: endPct ?? 0
         })
       ) {
         changed = true;
@@ -1077,31 +1566,36 @@
       typeof payload.books === 'object'
     ) {
       for (const [sdPath, rec] of Object.entries(payload.books)) {
-        if (!rec || typeof rec !== 'object' || !rec.days) continue;
-        for (const [dateKey, d] of Object.entries(rec.days)) {
-          const parts = parseIsoDateParts(d?.date || dateKey);
-          if (!parts) continue;
-          const prevDay = history.books[sdPath]?.days[parts.iso];
-          const didMerge = mergeHistoryDaySample(history, sdPath, {
-            date: parts.iso,
-            startPercent: d.startPercent,
-            endPercent: d.endPercent,
-            durationSeconds: d.durationSeconds,
-            isSession: false,
-            eventId: '',
-            isCompact: true
-          });
-          if (d.sessions && (!prevDay || d.sessions > prevDay.sessions)) {
-            history.books[sdPath].days[parts.iso].sessions = d.sessions;
-            changed = true;
+        if (!rec || typeof rec !== 'object') continue;
+        if (Array.isArray(rec.sessions)) {
+          for (let idx = 0; idx < rec.sessions.length; idx++) {
+            const norm = normalizeSessionRecord(rec.sessions[idx], idx + 1);
+            if (!norm) continue;
+            if (upsertHistorySessionRecord(history, sdPath, norm)) {
+              changed = true;
+            }
+            importedSessions += 1;
+            touchedBooks.add(sdPath);
           }
-          if (d.syncedToJournal && !history.books[sdPath].days[parts.iso].syncedToJournal) {
-            history.books[sdPath].days[parts.iso].syncedToJournal = true;
-            changed = true;
+        } else if (rec.days && typeof rec.days === 'object') {
+          for (const [dateKey, d] of Object.entries(rec.days)) {
+            const parts = parseIsoDateParts(d?.date || dateKey);
+            if (!parts) continue;
+            const didUpsert = upsertHistorySessionRecord(history, sdPath, {
+              sessionId: `legacy:${parts.iso}`,
+              recordType: 'legacy_daily_summary',
+              date: parts.iso,
+              startPercent: d.startPercent,
+              endPercent: d.endPercent,
+              durationSeconds: d.durationSeconds,
+              legacySessionCount: toFiniteNumber(d.sessions) || 1,
+              seenIds: Array.isArray(d.seenIds) ? d.seenIds : [],
+              syncedToJournal: Boolean(d.syncedToJournal)
+            });
+            if (didUpsert) changed = true;
+            importedSessions += 1;
+            touchedBooks.add(sdPath);
           }
-          if (didMerge) changed = true;
-          importedSessions += 1;
-          touchedBooks.add(sdPath);
         }
       }
       return { history, importedSessions, importedBooks: touchedBooks.size, changed };
@@ -1178,6 +1672,8 @@
       }
     }
 
+    const baseKeyOccurrences = new Map();
+
     for (let i = 0; i < flatList.length; i++) {
       const rawItem = flatList[i];
       if (!rawItem || typeof rawItem !== 'object') continue;
@@ -1217,6 +1713,21 @@
       }
       if (!sdPath) continue;
 
+      const parseTsField = (val) => {
+        let num = toFiniteNumber(val);
+        if (num !== null) return num > 1e11 ? Math.floor(num / 1000) : num;
+        if (typeof val === 'string') {
+          const trimmed = val.trim();
+          if (trimmed.includes('T') || /\d{2}:\d{2}/.test(trimmed)) {
+            const ms = Date.parse(trimmed);
+            if (Number.isFinite(ms)) return Math.floor(ms / 1000);
+          }
+        }
+        return null;
+      };
+
+      const startTime = parseTsField(s.start_time ?? s.startTime ?? s.started_at ?? s.startedAt);
+      const endTime = parseTsField(s.end_time ?? s.endTime ?? s.ended_at ?? s.endedAt);
       const tsRaw =
         s.end_time ??
         s.endTime ??
@@ -1230,31 +1741,21 @@
         s.startedAt ??
         s.created_at ??
         s.createdAt;
-      let ts = toFiniteNumber(tsRaw);
-      if (ts !== null && ts > 1e11) {
-        ts = Math.floor(ts / 1000);
-      }
+      let ts = parseTsField(tsRaw);
       let dateParts = parseIsoDateParts(s.date);
-      if (!dateParts && typeof tsRaw === 'string') {
+      if (!dateParts && typeof tsRaw === 'string' && ts === null) {
         const trimmedTs = tsRaw.trim();
-        if (trimmedTs.includes('T') || /\d{2}:\d{2}/.test(trimmedTs)) {
+        dateParts = parseIsoDateParts(trimmedTs.slice(0, 10));
+        if (!dateParts && trimmedTs) {
           const parsedMs = Date.parse(trimmedTs);
           if (Number.isFinite(parsedMs)) {
             ts = Math.floor(parsedMs / 1000);
           }
         }
-        if (ts === null) {
-          dateParts = parseIsoDateParts(trimmedTs.slice(0, 10));
-          if (!dateParts && trimmedTs) {
-            const parsedMs = Date.parse(trimmedTs);
-            if (Number.isFinite(parsedMs)) {
-              ts = Math.floor(parsedMs / 1000);
-            }
-          }
-        }
       }
-      const date = (dateParts && dateParts.iso) || localIsoDateFromTs(ts);
+      const date = (dateParts && dateParts.iso) || localIsoDateFromTs(endTime ?? ts ?? startTime);
       if (!date) continue;
+      const startDate = startTime !== null ? localIsoDateFromTs(startTime) || date : date;
 
       let endPct = computePercentFromVars(s);
       if (endPct === null) {
@@ -1264,25 +1765,46 @@
         if (rawP !== null) endPct = Math.max(0, Math.min(100, Math.round(rawP)));
       }
       let startPct = toFiniteNumber(s.startPercent ?? s.start_pct ?? s.start_percent);
-      const startBp = toFiniteNumber(s.start_progress_bp);
+      const startBp = toFiniteNumber(s.start_progress_bp ?? s.startProgressBp);
+      const endBp = toFiniteNumber(s.end_progress_bp ?? s.endProgressBp);
+      const scaleRaw = toFiniteNumber(s.progress_scale ?? s.progressScale);
+      const scale = scaleRaw && scaleRaw > 0 ? scaleRaw : 10000;
       if (startPct === null && startBp !== null) {
-        const scaleRaw = toFiniteNumber(s.progress_scale);
-        const scale = scaleRaw && scaleRaw > 0 ? scaleRaw : 10000;
         startPct = Math.max(0, Math.min(100, Math.round((startBp / scale) * 100)));
       }
-      const dur = toFiniteNumber(s.duration_seconds ?? s.durationSeconds ?? s.duration_sec ?? s.duration ?? s.seconds) || 0;
-      const evId = s.id ? String(s.id) : `imp:${date}:${ts || i}:${endPct ?? ''}`;
-      const isSession = evType ? evType === 'reader.session' : true;
+      const dur = Math.max(
+        0,
+        Math.round(toFiniteNumber(s.duration_seconds ?? s.durationSeconds ?? s.duration_sec ?? s.duration ?? s.seconds) || 0)
+      );
+      const isSession = evType ? evType === 'reader.session' : (s.recordType ? s.recordType === 'reading_session' : true);
+      const recordType = isSession ? 'reading_session' : 'progress_checkpoint';
+
+      const explicitId = s.sessionId || s.session_id || s.id;
+      let sessionId = '';
+      if (explicitId) {
+        sessionId = String(explicitId);
+      } else {
+        const baseKey = `imp:${sdPath}|${recordType}|${startTime ?? ts ?? date}|${endTime ?? ''}|${dur}|${startBp ?? startPct ?? ''}|${endBp ?? endPct ?? ''}`;
+        const occ = (baseKeyOccurrences.get(baseKey) || 0) + 1;
+        baseKeyOccurrences.set(baseKey, occ);
+        sessionId = `${baseKey}#${occ}`;
+      }
 
       if (
-        mergeHistoryDaySample(history, sdPath, {
+        upsertHistorySessionRecord(history, sdPath, {
+          sessionId,
+          recordType,
           date,
-          startPercent: startPct,
-          endPercent: endPct,
+          startDate,
+          startTime,
+          endTime,
+          sortTs: endTime ?? ts ?? startTime,
           durationSeconds: dur,
-          isSession,
-          eventId: evId,
-          isCompact: false
+          startProgressBp: startBp,
+          endProgressBp: endBp,
+          progressScale: scale,
+          startPercent: startPct,
+          endPercent: endPct ?? 0
         })
       ) {
         changed = true;
@@ -1294,7 +1816,7 @@
     return { history, importedSessions, importedBooks: touchedBooks.size, changed };
   }
 
-  function getBookHistoryDays(historyData, row) {
+  function getBookHistorySessions(historyData, row) {
     if (!historyData || !historyData.books || !row) return [];
     const targetPaths = new Set();
     if (row.sdPath) targetPaths.add(row.sdPath);
@@ -1302,50 +1824,134 @@
     const refPath = row.sdPath || (row.mapping && row.mapping.sdPath) || '';
     const targetNormFile = refPath ? extractFilenameMeta(refPath).normFilename : '';
 
-    const mergedByDate = new Map();
+    const bySessionId = new Map();
     for (const [bookPath, rec] of Object.entries(historyData.books)) {
-      if (!rec || !rec.days || typeof rec.days !== 'object') continue;
+      if (!rec || typeof rec !== 'object') continue;
       const matchesPath = targetPaths.has(bookPath);
       const matchesFile = Boolean(targetNormFile) && extractFilenameMeta(bookPath).normFilename === targetNormFile;
       if (!matchesPath && !matchesFile) continue;
 
-      for (const [dateKey, d] of Object.entries(rec.days)) {
-        if (!d) continue;
-        const iso = String(d.date || dateKey);
-        if (!iso) continue;
-        const prev = mergedByDate.get(iso);
-        if (!prev) {
-          mergedByDate.set(iso, Object.assign({}, d, { date: iso }));
-        } else {
-          const nextEnd =
-            d.endPercent !== null && d.endPercent !== undefined
-              ? (prev.endPercent !== null && prev.endPercent !== undefined ? Math.max(prev.endPercent, d.endPercent) : d.endPercent)
-              : prev.endPercent;
-          const nextStart =
-            d.startPercent !== null && d.startPercent !== undefined
-              ? (prev.startPercent !== null && prev.startPercent !== undefined ? Math.min(prev.startPercent, d.startPercent) : d.startPercent)
-              : prev.startPercent;
-          mergedByDate.set(iso, {
+      if (Array.isArray(rec.sessions) && rec.sessions.length > 0) {
+        for (let i = 0; i < rec.sessions.length; i++) {
+          const norm = normalizeSessionRecord(rec.sessions[i], i + 1);
+          if (!norm) continue;
+          if (!bySessionId.has(norm.sessionId)) {
+            bySessionId.set(norm.sessionId, norm);
+          }
+        }
+      } else if (rec.days && typeof rec.days === 'object') {
+        for (const [dateKey, d] of Object.entries(rec.days)) {
+          if (!d) continue;
+          const iso = String(d.date || dateKey);
+          if (!iso) continue;
+          const leg = normalizeSessionRecord({
+            sessionId: `legacy:${iso}`,
+            recordType: 'legacy_daily_summary',
             date: iso,
-            startPercent: nextStart,
-            endPercent: nextEnd,
-            durationSeconds: Math.max(prev.durationSeconds || 0, d.durationSeconds || 0),
-            sessions: Math.max(prev.sessions || 0, d.sessions || 0),
-            syncedToJournal: Boolean(prev.syncedToJournal || d.syncedToJournal),
-            seenIds: Array.from(new Set([...(prev.seenIds || []), ...(d.seenIds || [])])).slice(-40)
+            startPercent: d.startPercent,
+            endPercent: d.endPercent,
+            durationSeconds: d.durationSeconds,
+            legacySessionCount: d.sessions,
+            seenIds: d.seenIds,
+            syncedToJournal: d.syncedToJournal
           });
+          if (leg && !bySessionId.has(leg.sessionId)) {
+            bySessionId.set(leg.sessionId, leg);
+          }
         }
       }
     }
 
-    return Array.from(mergedByDate.values())
-      .filter((d) => d && d.date && ((d.endPercent !== null && d.endPercent > 0) || (d.durationSeconds || 0) > 0 || d.syncedToJournal))
-      .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    const realSeenIds = new Set();
+    for (const s of bySessionId.values()) {
+      if (s.recordType !== 'legacy_daily_summary') {
+        realSeenIds.add(s.sessionId);
+        for (const sid of s.seenIds || []) realSeenIds.add(sid);
+      }
+    }
+
+    const sorted = Array.from(bySessionId.values())
+      .filter((s) => {
+        if (!s || !s.date) return false;
+        if (s.recordType === 'legacy_daily_summary') {
+          const nonLeg = (s.seenIds || []).filter((id) => !String(id).startsWith('legacy:'));
+          if (nonLeg.length > 0 && nonLeg.every((id) => realSeenIds.has(id))) return false;
+        }
+        return (
+          s.recordType === 'reading_session' ||
+          (s.endPercent !== null && s.endPercent > 0) ||
+          (s.durationSeconds || 0) > 0 ||
+          s.syncedToJournal
+        );
+      })
+      .sort(compareSessionRecords);
+
+    let sessionNum = 0;
+    let runningPrevPct = null;
+    for (const s of sorted) {
+      if (s.recordType === 'reading_session') {
+        sessionNum += 1;
+        s.sessionNumber = sessionNum;
+      } else {
+        s.sessionNumber = null;
+      }
+      if (s.startPercent === null && runningPrevPct !== null) {
+        s.startPercent = runningPrevPct;
+      }
+      if (s.endPercent !== null && s.endPercent !== undefined) {
+        runningPrevPct = s.endPercent;
+      }
+    }
+    return sorted;
   }
 
-  function getBookDisplayHistoryDays(historyData, row) {
+  function getBookHistoryDays(historyData, row) {
+    const sessions = getBookHistorySessions(historyData, row);
+    const mergedByDate = new Map();
+    for (const s of sessions) {
+      if (!s || !s.date) continue;
+      const iso = s.date;
+      if (!mergedByDate.has(iso)) {
+        mergedByDate.set(iso, {
+          date: iso,
+          startPercent: s.startPercent ?? null,
+          endPercent: s.endPercent ?? null,
+          durationSeconds: 0,
+          sessions: 0,
+          syncedToJournal: true,
+          seenIds: []
+        });
+      }
+      const d = mergedByDate.get(iso);
+      if (s.startPercent !== null && s.startPercent !== undefined) {
+        if (d.startPercent === null || s.startPercent < d.startPercent) {
+          d.startPercent = s.startPercent;
+        }
+      }
+      if (s.endPercent !== null && s.endPercent !== undefined) {
+        if (d.endPercent === null || s.endPercent > d.endPercent) {
+          d.endPercent = s.endPercent;
+        }
+      }
+      d.durationSeconds += s.durationSeconds || 0;
+      if (s.recordType === 'legacy_daily_summary') {
+        d.sessions += Math.max(1, s.legacySessionCount || 1);
+      } else if (s.recordType === 'reading_session') {
+        d.sessions += 1;
+      }
+      if (!s.syncedToJournal && s.syncStatus !== 'synced') {
+        d.syncedToJournal = false;
+      }
+      for (const sid of s.seenIds || [s.sessionId]) {
+        if (sid && !d.seenIds.includes(sid)) d.seenIds.push(sid);
+      }
+    }
+    return Array.from(mergedByDate.values()).sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  }
+
+  function getBookDisplayHistorySessions(historyData, row) {
     if (!row) return [];
-    const realDays = getBookHistoryDays(historyData, row);
+    const realSessions = getBookHistorySessions(historyData, row);
     const startParts = parseIsoDateParts(row.startDate);
     const startIso = startParts ? startParts.iso : '';
     const endParts = parseIsoDateParts(row.lastDate);
@@ -1355,19 +1961,21 @@
     }
     if (!endIso) endIso = startIso;
 
-    const ignoreExitOnlyRealDays =
-      realDays.length > 0 &&
-      realDays.every((d) => !(d.durationSeconds > 0) && !(d.sessions > 0)) &&
+    const ignoreExitOnlyReal =
+      realSessions.length > 0 &&
+      realSessions.every((s) => s.recordType !== 'reading_session' && !(s.durationSeconds > 0)) &&
       ((row.durationSeconds || 0) > 0 ||
         (row.sessions || 0) > 0 ||
         ((row.devicePercent === 100 || (row.mapping && row.mapping.status === 'read')) &&
           Boolean(endIso) &&
-          endIso < realDays[0].date));
+          endIso < realSessions[0].date));
 
-    if (realDays.length > 0 && !ignoreExitOnlyRealDays) {
-      const out = realDays.slice();
-      if (startIso && startIso < out[0].date) {
+    if (realSessions.length > 0 && !ignoreExitOnlyReal) {
+      const out = realSessions.slice();
+      const firstDate = out[0].startDate || out[0].date;
+      if (startIso && firstDate && startIso < firstDate) {
         out.unshift({
+          sessionId: `milestone:start:${startIso}`,
           date: startIso,
           isStartMilestone: true,
           synthetic: true,
@@ -1389,6 +1997,7 @@
     const out = [];
     if (startIso && endIso && startIso < endIso) {
       out.push({
+        sessionId: `milestone:start:${startIso}`,
         date: startIso,
         isStartMilestone: true,
         synthetic: true,
@@ -1398,6 +2007,7 @@
       });
     }
     out.push({
+      sessionId: `milestone:summary:${endIso || startIso}`,
       date: endIso || startIso,
       startPercent: null,
       endPercent: pct,
@@ -1415,14 +2025,26 @@
     return out;
   }
 
-  function getUnsyncedJournalDays(historyData, row) {
-    return getBookHistoryDays(historyData, row).filter(
-      (d) => !d.syncedToJournal && d.endPercent !== null && d.endPercent > 0
+  function getBookDisplayHistoryDays(historyData, row) {
+    return getBookDisplayHistorySessions(historyData, row);
+  }
+
+  function getUnsyncedJournalSessions(historyData, row) {
+    return getBookHistorySessions(historyData, row).filter(
+      (s) =>
+        !s.syncedToJournal &&
+        s.syncStatus !== 'synced' &&
+        s.syncStatus !== 'needs_reconciliation' &&
+        (s.recordType === 'reading_session' || (s.endPercent !== null && s.endPercent > 0))
     );
   }
 
-  function markHistoryDaySynced(historyData, row, dateIso) {
-    if (!historyData || !historyData.books || !row || !dateIso) return false;
+  function getUnsyncedJournalDays(historyData, row) {
+    return getUnsyncedJournalSessions(historyData, row);
+  }
+
+  function updateHistorySessionLedger(historyData, row, sessionId, patch) {
+    if (!historyData || !historyData.books || !row || !sessionId || !patch) return false;
     const targetPaths = new Set();
     if (row.sdPath) targetPaths.add(row.sdPath);
     if (row.mapping && row.mapping.sdPath) targetPaths.add(row.mapping.sdPath);
@@ -1430,17 +2052,78 @@
     const targetNormFile = refPath ? extractFilenameMeta(refPath).normFilename : '';
     let changed = false;
     for (const [bookPath, rec] of Object.entries(historyData.books)) {
-      if (!rec || !rec.days || typeof rec.days !== 'object') continue;
+      if (!rec || typeof rec !== 'object') continue;
       const matchesPath = targetPaths.has(bookPath);
       const matchesFile = Boolean(targetNormFile) && extractFilenameMeta(bookPath).normFilename === targetNormFile;
       if (!matchesPath && !matchesFile) continue;
-      const d = rec.days[dateIso];
-      if (d && !d.syncedToJournal) {
-        d.syncedToJournal = true;
-        changed = true;
+      if (Array.isArray(rec.sessions)) {
+        for (const s of rec.sessions) {
+          if (s && s.sessionId === sessionId) {
+            Object.assign(s, patch);
+            if (patch.syncStatus === 'synced') s.syncedToJournal = true;
+            else if (patch.syncStatus && patch.syncStatus !== 'synced') s.syncedToJournal = false;
+            else if (patch.syncedToJournal !== undefined) s.syncStatus = patch.syncedToJournal ? 'synced' : 'pending';
+            changed = true;
+          }
+        }
       }
+      if (changed) rebuildDerivedDaysForBook(rec);
     }
     return changed;
+  }
+
+  function markHistoryDaySynced(historyData, row, dateOrSessionId, journalEntryId = null) {
+    if (!historyData || !historyData.books || !row || !dateOrSessionId) return false;
+    const byId = updateHistorySessionLedger(historyData, row, dateOrSessionId, {
+      syncStatus: 'synced',
+      syncedToJournal: true,
+      journalEntryId: journalEntryId || null,
+      prePostRemoteIds: null,
+      candidateJournalEntryIds: null
+    });
+    if (byId) return true;
+
+    const targetPaths = new Set();
+    if (row.sdPath) targetPaths.add(row.sdPath);
+    if (row.mapping && row.mapping.sdPath) targetPaths.add(row.mapping.sdPath);
+    const refPath = row.sdPath || (row.mapping && row.mapping.sdPath) || '';
+    const targetNormFile = refPath ? extractFilenameMeta(refPath).normFilename : '';
+    let changed = false;
+    for (const [bookPath, rec] of Object.entries(historyData.books)) {
+      if (!rec || typeof rec !== 'object') continue;
+      const matchesPath = targetPaths.has(bookPath);
+      const matchesFile = Boolean(targetNormFile) && extractFilenameMeta(bookPath).normFilename === targetNormFile;
+      if (!matchesPath && !matchesFile) continue;
+      if (Array.isArray(rec.sessions)) {
+        for (const s of rec.sessions) {
+          if (s && s.date === dateOrSessionId && !s.syncedToJournal) {
+            s.syncedToJournal = true;
+            s.syncStatus = 'synced';
+            changed = true;
+          }
+        }
+      }
+      if (rec.days && rec.days[dateOrSessionId] && !rec.days[dateOrSessionId].syncedToJournal) {
+        rec.days[dateOrSessionId].syncedToJournal = true;
+        changed = true;
+      }
+      if (changed) rebuildDerivedDaysForBook(rec);
+    }
+    return changed;
+  }
+
+  function collectClaimedJournalEntryIds(historyData) {
+    const claimed = new Set();
+    if (!historyData || !historyData.books || typeof historyData.books !== 'object') return claimed;
+    for (const rec of Object.values(historyData.books)) {
+      if (!rec || !Array.isArray(rec.sessions)) continue;
+      for (const s of rec.sessions) {
+        if (s && s.journalEntryId) {
+          claimed.add(String(s.journalEntryId));
+        }
+      }
+    }
+    return claimed;
   }
 
   function isJournalDayAlreadyOnStoryGraph(journalEntries, dateIso, targetVal, usePages) {
@@ -2082,9 +2765,19 @@
       buildJournalEntryDeleteBody,
       planJournalCleanup,
       buildDatedProgressFormBody,
+      cloneHistoryData,
       mergeEventsIntoHistory,
       parseSessionHistoryText,
       importSessionHistoryPayload,
+      formatLocalClockFromTs,
+      getTimeOfDayPeriodFromTs,
+      formatSessionTimeRangeLabel,
+      formatSessionJournalNote,
+      getBookHistorySessions,
+      getBookDisplayHistorySessions,
+      getUnsyncedJournalSessions,
+      updateHistorySessionLedger,
+      collectClaimedJournalEntryIds,
       getBookHistoryDays,
       getBookDisplayHistoryDays,
       getUnsyncedJournalDays,
@@ -2123,7 +2816,7 @@
     let userAgent = lsGet(LS_UA_KEY, typeof navigator !== 'undefined' ? navigator.userAgent : '');
     let autoCompact = lsGet(LS_AUTO_COMPACT_KEY, '1') !== '0';
     let overwriteLowerInBatch = lsGet(LS_OVERWRITE_LOWER_KEY, '0') === '1';
-    let includeJournalNotes = lsGet(LS_JOURNAL_NOTES_KEY, '0') === '1';
+    let includeJournalNotes = lsGet(LS_JOURNAL_NOTES_KEY, '1') !== '0';
     let mapData = { version: 1, books: {} };
     let historyData = { version: 1, books: {} };
     let outboxBytes = 0;
@@ -2494,8 +3187,8 @@
       return { updated: false, skippedReason: 'unsupported-status', pageInfo: info };
     }
 
-    async function executeJournalCleanupPlan(bookId, journalParsed, fallbackCsrf, journalUrl) {
-      const plan = planJournalCleanup(journalParsed && journalParsed.entries);
+    async function executeJournalCleanupPlan(bookId, journalParsed, fallbackCsrf, journalUrl, opts = {}) {
+      const plan = planJournalCleanup(journalParsed && journalParsed.entries, opts);
       if (plan.updates.length === 0 && plan.deletes.length === 0) {
         return { updated: 0, deleted: 0, entries: (journalParsed && journalParsed.entries) || [] };
       }
@@ -2564,22 +3257,36 @@
       const journalUrl = `${BASE_URL}/journal?book_id=${encodeURIComponent(mapping.bookId)}`;
       const journalHtml = await fetchStoryGraphHtml(journalUrl);
       const journalParsed = parseStoryGraphJournalPage(journalHtml);
-      return executeJournalCleanupPlan(mapping.bookId, journalParsed, journalParsed.csrf, journalUrl);
+      const claimedEntryIds = collectClaimedJournalEntryIds(historyData);
+      const rowSessions = getBookHistorySessions(historyData, row);
+      const hasZeroPctSession = rowSessions.some(
+        (s) => s.recordType === 'reading_session' && (s.endPercent === 0 || s.endPercent === null)
+      );
+      return executeJournalCleanupPlan(mapping.bookId, journalParsed, journalParsed.csrf, journalUrl, {
+        claimedEntryIds,
+        hasZeroPctSession
+      });
     }
 
     async function syncBookJournalCore(row, pageInfo, activeBookUrl, opts = {}) {
-      const unsynced = getUnsyncedJournalDays(historyData, row);
+      const allSessions = getBookHistorySessions(historyData, row);
+      const unsynced = getUnsyncedJournalSessions(historyData, row);
       if (unsynced.length === 0) {
-        return { posted: 0, skipped: 0, lastPostedPercent: null, pageInfo };
+        return { posted: 0, skipped: 0, flaggedReconciliation: 0, lastPostedPercent: null, pageInfo };
       }
       const journalUrl = `${BASE_URL}/journal?book_id=${encodeURIComponent(pageInfo.bookId)}`;
       const journalHtml = await fetchStoryGraphHtml(journalUrl);
       let journalParsed = parseStoryGraphJournalPage(journalHtml);
+      const claimedEntryIds = collectClaimedJournalEntryIds(historyData);
+      const hasZeroPctSession = allSessions.some(
+        (s) => s.recordType === 'reading_session' && (s.endPercent === 0 || s.endPercent === null)
+      );
       const cleanRes = await executeJournalCleanupPlan(
         pageInfo.bookId,
         journalParsed,
         pageInfo.csrf,
-        journalUrl
+        journalUrl,
+        { claimedEntryIds, hasZeroPctSession }
       );
       if (cleanRes.deleted > 0 || cleanRes.updated > 0) {
         journalParsed.entries = cleanRes.entries;
@@ -2589,35 +3296,152 @@
       let lastPct = pageInfo.lastReachedPercent || 0;
       let posted = 0;
       let skipped = 0;
+      let flaggedReconciliation = 0;
       let lastPostedPercent = null;
       let histChanged = false;
 
-      for (const day of unsynced) {
-        if (opts && opts.excludeHundredPercent && day.endPercent !== null && day.endPercent >= 100) {
-          if (markHistoryDaySynced(historyData, row, day.date)) histChanged = true;
+      const entryMatchesTarget = (e, dateIso, targetVal, expectedNote) => {
+        if (!e || e.date !== dateIso) return false;
+        if (e.statusKind === 'finished') return false;
+        if (e.isStatus) return false;
+        if (usePages && e.pages !== null && e.pages !== undefined) {
+          if (e.pages !== targetVal) return false;
+        } else if (!usePages && e.percent !== null && e.percent !== undefined) {
+          if (e.percent !== targetVal) return false;
+        } else {
+          return false;
+        }
+        if (expectedNote && e.note && e.note !== expectedNote) {
+          return false;
+        }
+        return true;
+      };
+
+      // Count how many unsynced sessions share each (date, targetVal) tuple
+      const computeSessionTargetVal = (sess) => {
+        const pct = sess.endPercent ?? 0;
+        if (!usePages) return pct;
+        if (sess.endProgressBp !== null && sess.endProgressBp !== undefined) {
+          return Math.max(
+            0,
+            Math.min(pageInfo.bookNumOfPages, Math.round((sess.endProgressBp / (sess.progressScale || 10000)) * pageInfo.bookNumOfPages))
+          );
+        }
+        return pct > 0
+          ? Math.max(1, Math.min(pageInfo.bookNumOfPages, Math.round((pct / 100) * pageInfo.bookNumOfPages)))
+          : 0;
+      };
+
+      for (const session of unsynced) {
+        const isGenuineFinalSitting =
+          session.recordType === 'reading_session' && (session.durationSeconds || 0) > 0;
+        if (
+          opts &&
+          opts.excludeHundredPercent &&
+          !isGenuineFinalSitting &&
+          session.endPercent !== null &&
+          session.endPercent >= 100
+        ) {
+          if (markHistoryDaySynced(historyData, row, session.sessionId)) histChanged = true;
           skipped++;
           continue;
         }
-        const targetVal = usePages
-          ? Math.max(1, Math.min(pageInfo.bookNumOfPages, Math.round((day.endPercent / 100) * pageInfo.bookNumOfPages)))
-          : day.endPercent;
 
-        if (isJournalDayAlreadyOnStoryGraph(journalParsed.entries, day.date, targetVal, usePages)) {
-          if (markHistoryDaySynced(historyData, row, day.date)) histChanged = true;
+        const targetVal = computeSessionTargetVal(session);
+        const note = formatSessionJournalNote(session, includeJournalNotes);
+
+        // 1. Reconcile an interrupted 'in_flight' session (Issue B)
+        if (session.syncStatus === 'in_flight') {
+          const preSet = new Set(Array.isArray(session.prePostRemoteIds) ? session.prePostRemoteIds : []);
+          const candidates = (journalParsed.entries || []).filter(
+            (e) =>
+              e &&
+              e.entryId &&
+              !claimedEntryIds.has(e.entryId) &&
+              !preSet.has(e.entryId) &&
+              entryMatchesTarget(e, session.date, targetVal, note)
+          );
+          if (candidates.length === 1) {
+            const matchedId = candidates[0].entryId;
+            claimedEntryIds.add(matchedId);
+            if (
+              updateHistorySessionLedger(historyData, row, session.sessionId, {
+                syncStatus: 'synced',
+                syncedToJournal: true,
+                journalEntryId: matchedId,
+                prePostRemoteIds: null,
+                candidateJournalEntryIds: null
+              })
+            ) {
+              histChanged = true;
+            }
+            skipped++;
+            continue;
+          } else if (candidates.length > 1) {
+            if (
+              updateHistorySessionLedger(historyData, row, session.sessionId, {
+                syncStatus: 'needs_reconciliation',
+                syncedToJournal: false,
+                candidateJournalEntryIds: candidates.map((c) => c.entryId)
+              })
+            ) {
+              histChanged = true;
+            }
+            flaggedReconciliation++;
+            skipped++;
+            continue;
+          }
+          // candidates.length === 0 -> previous POST never reached StoryGraph; proceed to submit
+        }
+
+        // 2. Check for an existing unclaimed remote entry from before ledger tracking
+        const unclaimedMatches = (journalParsed.entries || []).filter((e, idx) => {
+          const claimKey = e && (e.entryId || `${e.date}#${idx}`);
+          if (!claimKey || claimedEntryIds.has(claimKey)) return false;
+          if (e.date !== session.date) return false;
+          if (e.statusKind === 'finished' && !isGenuineFinalSitting) return true;
+          if (e.isStatus) return false;
+          if (usePages && e.pages !== null && e.pages !== undefined) {
+            return session.recordType === 'reading_session' ? e.pages === targetVal : e.pages >= targetVal;
+          }
+          if (!usePages && e.percent !== null && e.percent !== undefined) {
+            return session.recordType === 'reading_session' ? e.percent === targetVal : e.percent >= targetVal;
+          }
+          return false;
+        });
+
+        if (unclaimedMatches.length === 1) {
+          const matched = unclaimedMatches[0];
+          const claimKey = matched.entryId || `${matched.date}#0`;
+          claimedEntryIds.add(claimKey);
+          if (
+            updateHistorySessionLedger(historyData, row, session.sessionId, {
+              syncStatus: 'synced',
+              syncedToJournal: true,
+              journalEntryId: matched.entryId || null,
+              prePostRemoteIds: null,
+              candidateJournalEntryIds: null
+            })
+          ) {
+            histChanged = true;
+          }
           skipped++;
           continue;
         }
 
-        const note =
-          includeJournalNotes && day.durationSeconds > 0
-            ? `${formatDuration(day.durationSeconds)} read on X4 Pro`
-            : '';
+        // 3. Snapshot current remote IDs and mark session in_flight before POST
+        const prePostIds = (journalParsed.entries || []).map((e) => e && e.entryId).filter(Boolean);
+        updateHistorySessionLedger(historyData, row, session.sessionId, {
+          syncStatus: 'in_flight',
+          prePostRemoteIds: prePostIds
+        });
+        histChanged = true;
 
         await sleepMs(150);
         const body = buildDatedProgressFormBody({
           bookId: pageInfo.bookId,
           csrf: pageInfo.csrf,
-          date: day.date,
+          date: session.date,
           progressValue: targetVal,
           progressType: usePages ? 'pages' : 'percentage',
           bookNumOfPages: pageInfo.bookNumOfPages,
@@ -2636,15 +3460,41 @@
             await sleepMs(150);
             const reHtml = await fetchStoryGraphHtml(journalUrl);
             const reParsed = parseStoryGraphJournalPage(reHtml);
-            if (isJournalDayAlreadyOnStoryGraph(reParsed.entries, day.date, targetVal, usePages)) {
+            const preSet = new Set(prePostIds);
+            const newMatches = (reParsed.entries || []).filter(
+              (e) =>
+                e &&
+                e.entryId &&
+                !claimedEntryIds.has(e.entryId) &&
+                !preSet.has(e.entryId) &&
+                entryMatchesTarget(e, session.date, targetVal, note)
+            );
+            if (newMatches.length === 1) {
               journalParsed = reParsed;
-              if (markHistoryDaySynced(historyData, row, day.date)) histChanged = true;
-              lastPct = day.endPercent;
+              const mintedId = newMatches[0].entryId;
+              claimedEntryIds.add(mintedId);
+              updateHistorySessionLedger(historyData, row, session.sessionId, {
+                syncStatus: 'synced',
+                syncedToJournal: true,
+                journalEntryId: mintedId,
+                prePostRemoteIds: null,
+                candidateJournalEntryIds: null
+              });
+              lastPct = session.endPercent ?? lastPct;
               if (usePages) lastPages = targetVal;
-              else if (pageInfo.bookNumOfPages > 0) lastPages = Math.round((day.endPercent / 100) * pageInfo.bookNumOfPages);
+              else if (pageInfo.bookNumOfPages > 0) lastPages = Math.round(((session.endPercent || 0) / 100) * pageInfo.bookNumOfPages);
               posted++;
-              lastPostedPercent = day.endPercent;
+              lastPostedPercent = session.endPercent ?? lastPostedPercent;
               continue;
+            } else if (newMatches.length > 1) {
+              updateHistorySessionLedger(historyData, row, session.sessionId, {
+                syncStatus: 'needs_reconciliation',
+                syncedToJournal: false,
+                candidateJournalEntryIds: newMatches.map((m) => m.entryId)
+              });
+              flaggedReconciliation++;
+              await saveHistoryData();
+              throw new Error('Journal update ambiguous after 502; flagged for manual reconciliation.');
             }
           }
           if (histChanged) {
@@ -2655,19 +3505,46 @@
           throw new Error('Journal update failed: ' + (err && err.message ? err.message : err));
         }
 
-        if (markHistoryDaySynced(historyData, row, day.date)) histChanged = true;
-        lastPct = day.endPercent;
+        // Re-fetch journal to bind the newly minted journalEntryId into the ledger
+        let mintedId = null;
+        try {
+          await sleepMs(100);
+          const afterHtml = await fetchStoryGraphHtml(journalUrl);
+          const afterParsed = parseStoryGraphJournalPage(afterHtml);
+          journalParsed = afterParsed;
+          const preSet = new Set(prePostIds);
+          const mintedCandidates = (afterParsed.entries || []).filter(
+            (e) => e && e.entryId && !claimedEntryIds.has(e.entryId) && !preSet.has(e.entryId)
+          );
+          if (mintedCandidates.length === 1) {
+            mintedId = mintedCandidates[0].entryId;
+          } else {
+            const exact = mintedCandidates.find((e) => entryMatchesTarget(e, session.date, targetVal, note));
+            if (exact) mintedId = exact.entryId;
+          }
+          if (mintedId) claimedEntryIds.add(mintedId);
+        } catch (_) {}
+
+        updateHistorySessionLedger(historyData, row, session.sessionId, {
+          syncStatus: 'synced',
+          syncedToJournal: true,
+          journalEntryId: mintedId,
+          prePostRemoteIds: null,
+          candidateJournalEntryIds: null
+        });
+        histChanged = true;
+        lastPct = session.endPercent ?? lastPct;
         if (usePages) lastPages = targetVal;
-        else if (pageInfo.bookNumOfPages > 0) lastPages = Math.round((day.endPercent / 100) * pageInfo.bookNumOfPages);
+        else if (pageInfo.bookNumOfPages > 0) lastPages = Math.round(((session.endPercent || 0) / 100) * pageInfo.bookNumOfPages);
         posted++;
-        lastPostedPercent = day.endPercent;
+        lastPostedPercent = session.endPercent ?? lastPostedPercent;
       }
 
       if (histChanged) {
         await saveHistoryData();
       }
 
-      return { posted, skipped, lastPostedPercent, pageInfo };
+      return { posted, skipped, flaggedReconciliation, lastPostedPercent, pageInfo };
     }
 
     async function syncBookJournalAction(row) {
@@ -2869,38 +3746,29 @@
       for (const book of outboxBooks.values()) {
         if (book.normFilename) {
           for (const [oldPath, oldRec] of Object.entries(historyData.books || {})) {
-            if (!oldRec || !oldRec.days || oldPath === book.sdPath) continue;
+            if (!oldRec || oldPath === book.sdPath) continue;
             if (extractFilenameMeta(oldPath).normFilename !== book.normFilename) continue;
-            if (!historyData.books[book.sdPath]) {
-              historyData.books[book.sdPath] = { days: {} };
-            }
-            const destDays = historyData.books[book.sdPath].days;
-            for (const [dKey, dVal] of Object.entries(oldRec.days)) {
-              if (!dVal) continue;
-              const iso = String(dVal.date || dKey);
-              if (!iso) continue;
-              if (!destDays[iso]) {
-                destDays[iso] = Object.assign({}, dVal, { date: iso });
-              } else {
-                const cur = destDays[iso];
-                if (
-                  dVal.endPercent !== null &&
-                  dVal.endPercent !== undefined &&
-                  (cur.endPercent === null || cur.endPercent === undefined || dVal.endPercent > cur.endPercent)
-                ) {
-                  cur.endPercent = dVal.endPercent;
-                }
-                if (
-                  dVal.startPercent !== null &&
-                  dVal.startPercent !== undefined &&
-                  (cur.startPercent === null || cur.startPercent === undefined || dVal.startPercent < cur.startPercent)
-                ) {
-                  cur.startPercent = dVal.startPercent;
-                }
-                cur.durationSeconds = Math.max(cur.durationSeconds || 0, dVal.durationSeconds || 0);
-                cur.sessions = Math.max(cur.sessions || 0, dVal.sessions || 0);
-                cur.syncedToJournal = Boolean(cur.syncedToJournal || dVal.syncedToJournal);
-                cur.seenIds = Array.from(new Set([...(cur.seenIds || []), ...(dVal.seenIds || [])])).slice(-40);
+            const oldSessions = Array.isArray(oldRec.sessions) ? oldRec.sessions : [];
+            if (oldSessions.length > 0) {
+              for (const s of oldSessions) {
+                upsertHistorySessionRecord(historyData, book.sdPath, s);
+              }
+            } else if (oldRec.days && typeof oldRec.days === 'object') {
+              for (const [dKey, dVal] of Object.entries(oldRec.days)) {
+                if (!dVal) continue;
+                const iso = String(dVal.date || dKey);
+                if (!iso) continue;
+                upsertHistorySessionRecord(historyData, book.sdPath, {
+                  sessionId: `legacy:${iso}`,
+                  recordType: 'legacy_daily_summary',
+                  date: iso,
+                  startPercent: dVal.startPercent,
+                  endPercent: dVal.endPercent,
+                  durationSeconds: dVal.durationSeconds,
+                  legacySessionCount: dVal.sessions,
+                  seenIds: dVal.seenIds,
+                  syncedToJournal: dVal.syncedToJournal
+                });
               }
             }
             delete historyData.books[oldPath];
@@ -3002,6 +3870,7 @@
 
       for (const row of rows) {
         if (!row || row.staged) continue;
+        const histSessions = getBookHistorySessions(historyData, row);
         const histDays = getBookHistoryDays(historyData, row);
         if (histDays.length > 0) {
           let maxHistPct = null;
@@ -3022,7 +3891,9 @@
           if (histDur > (row.durationSeconds || 0)) {
             row.durationSeconds = histDur;
           }
-          const firstDate = histDays[0].date;
+          const firstSessionStart =
+            histSessions.length > 0 ? histSessions[0].startDate || histSessions[0].date : '';
+          const firstDate = firstSessionStart || histDays[0].date;
           const latestDay = histDays[histDays.length - 1];
           const latestDate = latestDay.date;
           if (firstDate && (!row.startDate || firstDate < row.startDate)) {
@@ -3254,17 +4125,34 @@
       let didPriorPost = false;
 
       const todayIso = localIsoDateFromTs(Math.floor(Date.now() / 1000));
-      const unsyncedJournalDays = getUnsyncedJournalDays(historyData, row);
+      const unsyncedJournalDays = getUnsyncedJournalSessions(historyData, row);
+      const hasGenuineHundredSession = unsyncedJournalDays.some(
+        (s) =>
+          s.recordType === 'reading_session' &&
+          (s.durationSeconds || 0) > 0 &&
+          s.endPercent !== null &&
+          s.endPercent >= 100
+      );
       const isMultiDayHistory =
         unsyncedJournalDays.length > 1 ||
+        hasGenuineHundredSession ||
         (unsyncedJournalDays.length > 0 &&
           unsyncedJournalDays.some(
-            (d) => d.date !== todayIso && ((d.sessions || 0) > 0 || (d.durationSeconds || 0) > 0)
+            (d) =>
+              d.date !== todayIso &&
+              (d.recordType === 'reading_session' || (d.legacySessionCount || 0) > 0 || (d.durationSeconds || 0) > 0)
           )) ||
-        (unsyncedJournalDays.length > 0 && includeJournalNotes);
+        (unsyncedJournalDays.length > 0 &&
+          includeJournalNotes &&
+          unsyncedJournalDays.some((d) => d.recordType === 'reading_session' || (d.durationSeconds || 0) > 0));
       const hasSub100JournalDays =
         isMultiDayHistory &&
-        unsyncedJournalDays.some((d) => d.endPercent !== null && d.endPercent > 0 && d.endPercent < 100);
+        (hasGenuineHundredSession ||
+          unsyncedJournalDays.some(
+            (d) =>
+              (d.endPercent !== null && d.endPercent > 0 && d.endPercent < 100) ||
+              (d.recordType === 'reading_session' && (d.durationSeconds || 0) > 0)
+          ));
 
       const postStatusRead = async () => {
         if (didPriorPost) await sleepMs(150);
@@ -3300,7 +4188,7 @@
         if (unsyncedJournalDays.length > 0) {
           let histMarked = false;
           for (const d of unsyncedJournalDays) {
-            if (markHistoryDaySynced(historyData, row, d.date)) histMarked = true;
+            if (markHistoryDaySynced(historyData, row, d.sessionId || d.date)) histMarked = true;
           }
           if (histMarked) {
             try {
@@ -4181,16 +5069,26 @@
             `</div>`
           : '';
 
+      const realHistSessions = getBookHistorySessions(historyData, row);
       const realHistDays = getBookHistoryDays(historyData, row);
-      const histDays = getBookDisplayHistoryDays(historyData, row);
+      const histItems = getBookDisplayHistorySessions(historyData, row);
       let historyHtml = '';
-      if (histDays.length > 0) {
-        const unsyncedHistCount = realHistDays.filter((d) => !d.syncedToJournal && d.endPercent !== null && d.endPercent > 0).length;
-        const isSyntheticOnly = histDays.every((d) => d.synthetic);
-        const rowsHtml = histDays
+      if (histItems.length > 0) {
+        const unsyncedHistCount = getUnsyncedJournalSessions(historyData, row).length;
+        const reconcileCount = realHistSessions.filter((s) => s.syncStatus === 'needs_reconciliation').length;
+        const isSyntheticOnly = histItems.every((d) => d.synthetic);
+        const totalDurSec = realHistSessions.reduce((sum, s) => sum + (s.durationSeconds || 0), 0);
+        const totalDurLabel = formatDurationLabel(totalDurSec);
+        const rowsHtml = histItems
           .slice()
           .reverse()
           .map((d) => {
+            let dateHeader = formatHumanDate(d.date);
+            if (!d.synthetic && d.recordType === 'reading_session' && (d.startTime !== null || d.endTime !== null)) {
+              const clockRange = formatSessionTimeRangeLabel(d);
+              const period = getTimeOfDayPeriodFromTs(d.startTime ?? d.endTime);
+              dateHeader = [dateHeader, clockRange, period].filter(Boolean).join(' · ');
+            }
             let metaText = '';
             if (d.isStartMilestone) {
               const stLabel = !m ? '' : d.syncedToJournal ? '<span class="sg-ok">Synced</span>' : '<span class="sg-muted">Start date</span>';
@@ -4201,12 +5099,32 @@
                 m && m.pageCount > 0 && d.endPercent !== null && d.endPercent !== undefined
                   ? ` (~${Math.round((d.endPercent / 100) * m.pageCount)}/${m.pageCount} pp)`
                   : '';
+              const hasTransition =
+                !d.synthetic &&
+                d.startPercent !== null &&
+                d.startPercent !== undefined &&
+                d.endPercent !== null &&
+                d.endPercent !== undefined;
               const deltaPct =
                 d.startPercent !== null && d.startPercent !== undefined && d.endPercent !== null && d.endPercent > d.startPercent
                   ? ` (+${d.endPercent - d.startPercent}%)`
                   : '';
-              const dayDurRaw = formatDuration(d.durationSeconds);
-              const dayDur = d.isSummary && dayDurRaw ? `${dayDurRaw} total` : dayDurRaw;
+              const progDisplay = hasTransition
+                ? `${escapeHtml(String(d.startPercent))}% → <strong>${escapeHtml(pctStr)}</strong>${escapeHtml(estPages)}${escapeHtml(deltaPct)}`
+                : `<strong>${escapeHtml(pctStr)}</strong>${escapeHtml(estPages)}${escapeHtml(deltaPct)}`;
+              const dayDurRaw = formatDurationLabel(d.durationSeconds);
+              const dayDur = (d.isSummary || d.recordType === 'legacy_daily_summary') && dayDurRaw ? `${dayDurRaw} total` : dayDurRaw;
+              let recordLabel = '';
+              if (!d.synthetic) {
+                if (d.recordType === 'reading_session') {
+                  recordLabel = `<strong>Reading session${d.sessionNumber ? ' ' + d.sessionNumber : ''}</strong>`;
+                } else if (d.recordType === 'progress_checkpoint') {
+                  recordLabel = '<strong>Progress checkpoint</strong>';
+                } else if (d.recordType === 'legacy_daily_summary') {
+                  const legCnt = d.legacySessionCount || 0;
+                  recordLabel = `<strong>Daily summary${legCnt > 0 ? ' (' + legCnt + ' session' + (legCnt === 1 ? '' : 's') + ')' : ''}</strong>`;
+                }
+              }
               const sessStr =
                 d.synthetic && (d.sessions > 0 || d.pagesTurned > 0)
                   ? [
@@ -4217,7 +5135,9 @@
                       .join(', ')
                   : '';
               let stText = '';
-              if (m) {
+              if (d.syncStatus === 'needs_reconciliation') {
+                stText = '<span class="sg-err">Needs reconciliation</span>';
+              } else if (m) {
                 if (d.synthetic) {
                   if (m.status === 'read' && d.endPercent === 100) {
                     stText = '<span class="sg-ok">Finished</span>';
@@ -4226,15 +5146,16 @@
                   } else if (d.endPercent !== null && d.endPercent > 0) {
                     stText = '<span class="sg-muted">Pending</span>';
                   }
-                } else if (d.syncedToJournal) {
+                } else if (d.syncedToJournal || d.syncStatus === 'synced') {
                   stText = '<span class="sg-ok">Journaled</span>';
-                } else if (d.endPercent !== null && d.endPercent > 0) {
+                } else if (d.recordType === 'reading_session' || (d.endPercent !== null && d.endPercent > 0)) {
                   stText = '<span class="sg-muted">Pending</span>';
                 }
               }
               metaText = [
-                `<strong>${escapeHtml(pctStr)}</strong>${escapeHtml(estPages)}${escapeHtml(deltaPct)}`,
-                dayDur ? escapeHtml(dayDur) : '',
+                recordLabel,
+                dayDur ? `<strong>${escapeHtml(dayDur)}</strong>` : '',
+                progDisplay,
                 sessStr ? escapeHtml(sessStr) : '',
                 stText
               ]
@@ -4243,7 +5164,7 @@
             }
             return (
               `<div class="sg-history-row">` +
-                `<span class="sg-history-date">${escapeHtml(formatHumanDate(d.date))}</span>` +
+                `<span class="sg-history-date">${escapeHtml(dateHeader)}</span>` +
                 `<span class="sg-history-meta">${metaText}</span>` +
               `</div>`
             );
@@ -4251,19 +5172,26 @@
           .join('');
         const histBtnHtml =
           m && unsyncedHistCount > 0
-            ? `<div class="sg-history-foot"><button type="button" class="sg-btn sg-btn-sm" data-act="sync-journal" data-key="${escapeHtml(row.key)}" title="Post unsynced daily checkpoints to StoryGraph Reading Journal">Sync Journal (${unsyncedHistCount})</button></div>`
+            ? `<div class="sg-history-foot"><button type="button" class="sg-btn sg-btn-sm" data-act="sync-journal" data-key="${escapeHtml(row.key)}" title="Post unsynced reading sessions to StoryGraph Reading Journal">Sync Journal (${unsyncedHistCount})</button></div>`
             : '';
         const unsyncedBadge =
-          m && unsyncedHistCount > 0
-            ? `<span class="sg-pill sg-pill-pending">${unsyncedHistCount} unsynced</span>`
-            : '';
-        const sessSummary =
-          isSyntheticOnly && row.sessions > 0
+          reconcileCount > 0
+            ? `<span class="sg-pill sg-pill-pending">${reconcileCount} needs reconciliation</span>`
+            : m && unsyncedHistCount > 0
+              ? `<span class="sg-pill sg-pill-pending">${unsyncedHistCount} unsynced</span>`
+              : '';
+        const dayCount = isSyntheticOnly ? histItems.length : realHistDays.length;
+        const realSessCount = realHistSessions.filter((s) => s.recordType === 'reading_session').length;
+        const sessSummary = isSyntheticOnly
+          ? row.sessions > 0
             ? ` · ${row.sessions} session${row.sessions === 1 ? '' : 's'}`
+            : ''
+          : realSessCount > 0
+            ? ` · ${realSessCount} session${realSessCount === 1 ? '' : 's'}${totalDurLabel ? ' · ' + totalDurLabel + ' total' : ''}`
             : '';
         historyHtml =
           `<details class="sg-history" data-history-key="${escapeHtml(row.key)}"${historyOpenByKey[row.key] ? ' open' : ''}>` +
-            `<summary class="sg-history-sum"><span>Reading history · ${histDays.length} day${histDays.length === 1 ? '' : 's'}${escapeHtml(sessSummary)}</span>${unsyncedBadge}</summary>` +
+            `<summary class="sg-history-sum"><span>Reading history · ${dayCount} day${dayCount === 1 ? '' : 's'}${escapeHtml(sessSummary)}</span>${unsyncedBadge}</summary>` +
             `<div class="sg-history-list">${rowsHtml}${histBtnHtml}</div>` +
           `</details>`;
       }
