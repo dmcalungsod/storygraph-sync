@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.env*
+*settings*.json
+*cookie*
+*token*
+*secret*
+events.jsonl
+storygraph-map.json
+reading-history.json
+backfill.json
+tmp-fetch.html
+*.log
+*.bak

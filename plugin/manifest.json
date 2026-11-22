@@ -1,0 +1,13 @@
+{
+  "name": "storygraph-sync",
+  "title": "StoryGraph Sync",
+  "description": "Sync reading progress from CrossInk to The StoryGraph.",
+  "mount": "files",
+  "version": "0.1.0",
+  "files": [
+    "manifest.json",
+    "device.json",
+    "plugin.js",
+    "README.md"
+  ]
+}

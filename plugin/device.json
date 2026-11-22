@@ -1,0 +1,21 @@
+{
+  "title": "StoryGraph Sync",
+  "description": "Records reading progress events for StoryGraph sync.",
+  "version": "0.1.0",
+  "events": {
+    "reader.exit": {
+      "request": {
+        "method": "POST",
+        "url": "http://127.0.0.1:1/storygraph-spool",
+        "body": "{}"
+      }
+    },
+    "reader.session": {
+      "request": {
+        "method": "POST",
+        "url": "http://127.0.0.1:1/storygraph-spool",
+        "body": "{}"
+      }
+    }
+  }
+}
