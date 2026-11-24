@@ -3023,6 +3023,59 @@
     let bookSort = 'smart';
     const sectionOpenState = { unlinked: true, reading: true, read: null };
     const historyOpenByKey = Object.create(null);
+    let prefsSaveTimer = null;
+
+    function applyPrefsFromMap() {
+      const p = mapData && typeof mapData.prefs === 'object' ? mapData.prefs : null;
+      if (!p) return;
+      if (typeof p.deviceLabel === 'string' && p.deviceLabel.trim()) {
+        deviceLabel = p.deviceLabel.trim();
+        lsSet(LS_DEVICE_LABEL_KEY, deviceLabel);
+      }
+      if (typeof p.includeJournalNotes === 'boolean') {
+        includeJournalNotes = p.includeJournalNotes;
+        lsSet(LS_JOURNAL_NOTES_KEY, includeJournalNotes ? '1' : '0');
+      }
+      if (typeof p.autoCompact === 'boolean') {
+        autoCompact = p.autoCompact;
+        lsSet(LS_AUTO_COMPACT_KEY, autoCompact ? '1' : '0');
+      }
+      if (typeof p.overwriteLowerInBatch === 'boolean') {
+        overwriteLowerInBatch = p.overwriteLowerInBatch;
+        lsSet(LS_OVERWRITE_LOWER_KEY, overwriteLowerInBatch ? '1' : '0');
+      }
+    }
+
+    async function persistPrefsToSd() {
+      mapData.prefs = {
+        deviceLabel: (deviceLabel || DEFAULT_DEVICE_LABEL).trim() || DEFAULT_DEVICE_LABEL,
+        includeJournalNotes: Boolean(includeJournalNotes),
+        autoCompact: Boolean(autoCompact),
+        overwriteLowerInBatch: Boolean(overwriteLowerInBatch)
+      };
+      try {
+        await saveMapData();
+      } catch (_) {}
+    }
+
+    function schedulePrefsSave() {
+      if (prefsSaveTimer) clearTimeout(prefsSaveTimer);
+      prefsSaveTimer = setTimeout(() => {
+        prefsSaveTimer = null;
+        persistPrefsToSd();
+      }, 450);
+      if (prefsSaveTimer && typeof prefsSaveTimer.unref === 'function') {
+        prefsSaveTimer.unref();
+      }
+    }
+
+    async function flushPendingPrefsSave() {
+      if (prefsSaveTimer) {
+        clearTimeout(prefsSaveTimer);
+        prefsSaveTimer = null;
+        await persistPrefsToSd();
+      }
+    }
 
     function lsGet(key, fallback) {
       try {
@@ -3969,6 +4022,7 @@
     }
 
     async function loadLocalState() {
+      await flushPendingPrefsSave();
       const [eventsText, mapText, backfillText, historyText] = await Promise.all([
         readPluginText(EVENTS_FILE),
         readPluginText(MAP_FILE),
@@ -3996,6 +4050,17 @@
             mapData = parsed;
           }
         } catch (_) {}
+      }
+
+      if (mapData.prefs && typeof mapData.prefs === 'object') {
+        applyPrefsFromMap();
+      } else if (
+        deviceLabel !== DEFAULT_DEVICE_LABEL ||
+        !includeJournalNotes ||
+        !autoCompact ||
+        overwriteLowerInBatch
+      ) {
+        await persistPrefsToSd();
       }
 
       if (historyText) {
@@ -5149,6 +5214,7 @@
         if (typeof parsed.deviceLabel === 'string') {
           deviceLabel = parsed.deviceLabel.trim() || DEFAULT_DEVICE_LABEL;
           lsSet(LS_DEVICE_LABEL_KEY, deviceLabel);
+          persistPrefsToSd();
         }
         syncSettingsInputs();
         setBanner('Imported browser settings.', 'ok');
@@ -6057,7 +6123,7 @@
             '<div class="sg-subblock">' +
               '<label class="sg-muted sg-check" title="Save session duration (e.g. 20m read on CrossPoint) inside StoryGraph reading journal notes"><input type="checkbox" id="sg-journal-notes" /> Include reading duration in StoryGraph journal notes</label>' +
               '<div class="sg-field" style="margin:8px 0 4px 0">' +
-                '<label for="sg-device-label">Journal device label (default: CrossPoint)</label>' +
+                '<label for="sg-device-label">Journal device label (saved to SD; default: CrossPoint)</label>' +
                 '<input type="text" id="sg-device-label" class="sg-input" placeholder="CrossPoint" />' +
               '</div>' +
               '<div id="sg-note-preview" class="sg-muted"></div>' +
@@ -6157,21 +6223,37 @@
     container.querySelector('#sg-auto-compact').addEventListener('change', (e) => {
       autoCompact = Boolean(e.target.checked);
       lsSet(LS_AUTO_COMPACT_KEY, autoCompact ? '1' : '0');
+      persistPrefsToSd();
     });
     container.querySelector('#sg-overwrite-lower').addEventListener('change', (e) => {
       overwriteLowerInBatch = Boolean(e.target.checked);
       lsSet(LS_OVERWRITE_LOWER_KEY, overwriteLowerInBatch ? '1' : '0');
+      persistPrefsToSd();
     });
     container.querySelector('#sg-journal-notes').addEventListener('change', (e) => {
       includeJournalNotes = Boolean(e.target.checked);
       lsSet(LS_JOURNAL_NOTES_KEY, includeJournalNotes ? '1' : '0');
       updateJournalNotePreview();
+      persistPrefsToSd();
     });
-    container.querySelector('#sg-device-label').addEventListener('input', (e) => {
+    const deviceLabelEl = container.querySelector('#sg-device-label');
+    deviceLabelEl.addEventListener('input', (e) => {
       deviceLabel = String(e.target.value || '').trim() || DEFAULT_DEVICE_LABEL;
       lsSet(LS_DEVICE_LABEL_KEY, deviceLabel);
       updateJournalNotePreview();
+      schedulePrefsSave();
     });
+    deviceLabelEl.addEventListener('change', () => {
+      deviceLabel = String(deviceLabelEl.value || '').trim() || DEFAULT_DEVICE_LABEL;
+      lsSet(LS_DEVICE_LABEL_KEY, deviceLabel);
+      updateJournalNotePreview();
+      if (prefsSaveTimer) {
+        clearTimeout(prefsSaveTimer);
+        prefsSaveTimer = null;
+      }
+      persistPrefsToSd();
+    });
+    deviceLabelEl.addEventListener('blur', flushPendingPrefsSave);
     container.querySelector('#sg-clear-cfg').addEventListener('click', async () => {
       if (Object.keys(cookieMap || {}).filter((k) => Boolean(cookieMap[k])).length === 0) {
         setBanner('No stored cookies to clear.', 'muted');

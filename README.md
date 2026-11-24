@@ -59,7 +59,7 @@ Because The StoryGraph does not offer a public API, the plugin signs requests us
 1. Start **File Transfer** on your e-reader and open `http://crosspoint.local/files` in your browser.
    - *Tip:* Using `http://crosspoint.local/files` instead of a raw IP keeps your browser `localStorage` cookies intact even if your router assigns a new DHCP IP later.
 2. Expand **Account Settings** and paste into **StoryGraph Cookies** (smart-paste accepts raw cookie headers, DevTools `cookie: ...`, **Cookie-Editor JSON**, Netscape `cookies.txt`, or cURL).
-3. *(Optional)* Customize **Journal device label** (defaults to `CrossPoint`, e.g. `X4 Pro`) or uncheck **Include reading duration in StoryGraph journal notes** (a live note preview updates below). Only edit **User-Agent** under **Advanced & Backup** if you copied cookies from a different browser.
+3. *(Optional)* Customize **Journal device label** (defaults to `CrossPoint`, e.g. `X4 Pro` — saved on the SD card inside `storygraph-map.json` alongside your journal/batch toggles so it persists across IP changes and devices) or uncheck **Include reading duration in StoryGraph journal notes** (a live note preview updates below). Only edit **User-Agent** under **Advanced & Backup** if you copied cookies from a different browser.
 4. Click **Verify Session**. You should see a green **Connected** badge and your StoryGraph **Current Reads** count.
 
 > **Security & Privacy Note:** Your session cookies are stored **only** in your browser's `localStorage` and are never written to the microSD card. `_storygraph_session` rotates automatically whenever StoryGraph sends `Set-Cookie`. Because firmware caps outbound request headers at `4,096` bytes / 16 headers, the plugin automatically trims non-essential cookies if your header is large (keeping `_storygraph_session`, `remember_user_token`, `cf_clearance`, and `__cf_bm`).
@@ -110,6 +110,7 @@ python backfill_sd.py --write-sd
 
 ```text
 storygraph-sync/
+├── .github/workflows/release.yml        # Automated ZIP + SHA256SUMS.txt GitHub Release workflow
 ├── src/
 │   └── plugin.js                        # Readable source for the browser plugin UI
 ├── scripts/

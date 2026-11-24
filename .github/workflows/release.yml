@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build & verify plugin
+        run: |
+          node scripts/build.mjs
+          node --check src/plugin.js
+          node --check storygraph-sync.crosspoint-plugin/plugin.js
+          node --check harness/server.mjs
+          node harness/test.mjs
+
+      - name: Verify manifest version matches tag
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            TAG="v$(node -p "require('./storygraph-sync.crosspoint-plugin/manifest.json').version")"
+          fi
+          MANIFEST_VER="$(node -p "require('./storygraph-sync.crosspoint-plugin/manifest.json').version")"
+          DEVICE_VER="$(node -p "require('./storygraph-sync.crosspoint-plugin/device.json').version")"
+          TAG_VER="${TAG#v}"
+          if [ "$MANIFEST_VER" != "$TAG_VER" ] || [ "$DEVICE_VER" != "$TAG_VER" ]; then
+            echo "Version mismatch: tag=$TAG_VER manifest=$MANIFEST_VER device=$DEVICE_VER"
+            exit 1
+          fi
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Package release ZIP and SHA-256 checksums
+        run: |
+          mkdir -p dist/pkg/storygraph-sync
+          node -e "
+            const fs = require('fs');
+            const path = require('path');
+            const m = JSON.parse(fs.readFileSync('storygraph-sync.crosspoint-plugin/manifest.json', 'utf8'));
+            for (const f of m.files || []) {
+              const src = path.join('storygraph-sync.crosspoint-plugin', f);
+              const dst = path.join('dist/pkg/storygraph-sync', f);
+              fs.mkdirSync(path.dirname(dst), { recursive: true });
+              fs.copyFileSync(src, dst);
+            }
+          "
+          ZIP_NAME="storygraph-sync-${RELEASE_TAG}.zip"
+          (cd dist/pkg && zip -r "../${ZIP_NAME}" storygraph-sync)
+          cp storygraph-sync.crosspoint-plugin/* dist/
+          (
+            cd dist
+            sha256sum "${ZIP_NAME}" > "${ZIP_NAME}.sha256"
+            sha256sum "${ZIP_NAME}" manifest.json device.json plugin.js README.md DETAILS.md > SHA256SUMS.txt
+          )
+          cat dist/SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: StoryGraph Sync ${{ env.RELEASE_TAG }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          files: |
+            dist/storygraph-sync-*.zip
+            dist/storygraph-sync-*.zip.sha256
+            dist/SHA256SUMS.txt

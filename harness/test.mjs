@@ -3747,6 +3747,35 @@ async function runTests() {
     assert.ok(cookieInput.value.includes('imported_sess'), 'Case 13: Settings file import must apply cookieHeader');
     assert.equal(mockContainer.querySelector('#sg-device-label').value, 'X4 Pro');
 
+    // Case 14b: Non-secret prefs (deviceLabel, toggles) persist to storygraph-map.json on SD across localStorage wipes / IP changes
+    dlInput.value = 'X4 Pro Custom';
+    await dlInput.trigger('change', { target: dlInput });
+    await waitForLong(() => {
+      const rawMap = virtualFiles.get('storygraph-map.json');
+      return rawMap && JSON.parse(rawMap.toString('utf8')).prefs?.deviceLabel === 'X4 Pro Custom';
+    }, 'Case 14b: deviceLabel must persist to storygraph-map.json');
+    const savedMapWithPrefs = JSON.parse(virtualFiles.get('storygraph-map.json').toString('utf8'));
+    assert.equal(savedMapWithPrefs.prefs.cookieHeader, undefined, 'Case 14b: Cookies must never be saved to SD prefs');
+    assert.equal(savedMapWithPrefs.prefs.userAgent, undefined, 'Case 14b: User-Agent must never be saved to SD prefs');
+    for (const k of ['sgSync.deviceLabel', 'sgSync.journalNotes', 'sgSync.autoCompact', 'sgSync.overwriteLower']) {
+      uiSandbox.localStorage.removeItem(k);
+    }
+    await refreshBtn.trigger('click');
+    assert.equal(dlInput.value, 'X4 Pro Custom', 'Case 14b: Refresh after localStorage wipe must restore deviceLabel from SD');
+    assert.ok(notePreview.textContent.includes('33m read on X4 Pro Custom'), 'Case 14b: Note preview must reflect SD-restored deviceLabel');
+
+    // Also verify a brand-new browser/origin mount (completely empty localStorage) picks up prefs from SD
+    store.clear();
+    const freshContainer = new MockUiElement('div', { id: 'plugin-storygraph-sync-fresh' });
+    await uiRegisteredPlugin(freshContainer, mockApi);
+    assert.equal(freshContainer.querySelector('#sg-device-label').value, 'X4 Pro Custom', 'Case 14b: Fresh origin mount must restore deviceLabel from SD');
+    assert.equal(freshContainer.querySelector('#sg-cookie-input').value, '', 'Case 14b: Fresh origin mount must still have empty cookies');
+    // Restore cookies & default label for subsequent tests
+    cookieInput.value = '_storygraph_session=imported_sess; cf_clearance=cf_ok';
+    await cookieInput.trigger('input', { target: cookieInput });
+    dlInput.value = 'X4 Pro';
+    await dlInput.trigger('change', { target: dlInput });
+
     // Reading history chevron label, Open Journal link (separate from a.sg-book-link), and single-book Clean Journal
     assert.ok(booksListEl.querySelectorAll('.sg-history-label').length > 0, 'Case 13: Reading history summary must wrap label in .sg-history-label for chevron');
     assert.ok(booksListEl.querySelectorAll('a.sg-journal-link').length > 0, 'Case 13: Linked books with history must render a.sg-journal-link');
