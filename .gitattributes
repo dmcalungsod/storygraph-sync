@@ -1,0 +1,4 @@
+# Keep plugin.js strictly LF so Windows clones stay comfortably under CrossInk's 256 KB /api/plugin-fs limit
+*.js text eol=lf
+*.mjs text eol=lf
+*.json text eol=lf

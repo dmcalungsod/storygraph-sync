@@ -45,16 +45,22 @@ Open any book on your e-reader, read a few pages, and exit back to Home. Firmwar
 
 Because The StoryGraph does not offer a public API, the plugin signs requests using your existing browser session cookies:
 
+#### Option A — Desktop Browser
 1. Log in to `https://app.thestorygraph.com/` in your desktop browser (ideally on the same non-VPN network as your e-reader if Cloudflare challenges requests).
 2. Open DevTools (**F12**) → **Network** tab → reload (**F5**).
-3. Click the main `app.thestorygraph.com` document request → **Request Headers** → copy the full `cookie` header value (it must include `_storygraph_session`, plus `cf_clearance` if present).
-4. Start **File Transfer** on your e-reader and open `http://crosspoint.local/files` in your browser.
+3. Click the main `app.thestorygraph.com` document request → **Request Headers** → copy the `cookie` header (or **Copy as cURL**).
+
+#### Option B — Smartphone Only (No PC)
+1. Install the **Cookie-Editor** extension in **Firefox** (Android) or **Safari** (iOS) and log in to `https://app.thestorygraph.com/` in that browser.
+2. Open **Cookie-Editor** on `app.thestorygraph.com` and tap **Export → JSON** (or **Header String**).
+   - *Tip:* Open `http://crosspoint.local/files` in that **same browser** so your `User-Agent` automatically matches — or set up once on desktop, click **Export Settings** (under **Account Settings → Advanced & Backup**), copy the JSON file to your phone, and use **Import Settings**.
+
+#### Paste & Verify
+1. Start **File Transfer** on your e-reader and open `http://crosspoint.local/files` in your browser.
    - *Tip:* Using `http://crosspoint.local/files` instead of a raw IP keeps your browser `localStorage` cookies intact even if your router assigns a new DHCP IP later.
-5. Scroll to the **StoryGraph Sync** card, expand **Account Settings**, and:
-   - Paste your `cookie` header into **StoryGraph Cookie header**.
-   - Confirm **User-Agent** matches your browser (auto-filled by default).
-   - *(Optional)* Set **Journal device label** (defaults to `CrossPoint`, e.g. `X4 Pro`) or uncheck **Include reading duration in StoryGraph journal notes** if you prefer blank journal notes.
-6. Click **Verify Session**. You should see a green confirmation with your StoryGraph **Current Reads** count.
+2. Expand **Account Settings** and paste into **StoryGraph Cookies** (smart-paste accepts raw cookie headers, DevTools `cookie: ...`, **Cookie-Editor JSON**, Netscape `cookies.txt`, or cURL).
+3. *(Optional)* Customize **Journal device label** (defaults to `CrossPoint`, e.g. `X4 Pro`) or uncheck **Include reading duration in StoryGraph journal notes** (a live note preview updates below). Only edit **User-Agent** under **Advanced & Backup** if you copied cookies from a different browser.
+4. Click **Verify Session**. You should see a green **Connected** badge and your StoryGraph **Current Reads** count.
 
 > **Security & Privacy Note:** Your session cookies are stored **only** in your browser's `localStorage` and are never written to the microSD card. `_storygraph_session` rotates automatically whenever StoryGraph sends `Set-Cookie`. Because firmware caps outbound request headers at `4,096` bytes / 16 headers, the plugin automatically trims non-essential cookies if your header is large (keeping `_storygraph_session`, `remember_user_token`, `cf_clearance`, and `__cf_bm`).
 
@@ -71,8 +77,12 @@ Because The StoryGraph does not offer a public API, the plugin signs requests us
    - Click **Sync Now** on one book or **Sync All** in the header to push all pending reading sessions, progress updates, **Read** completions, and start/finish dates.
    - Each sitting is recorded individually in StoryGraph's **Reading Journal** (e.g. `20:10–20:55 · 45m read on CrossPoint`).
    - Use **Sync Dates** anytime to align start/finish dates for previously synced books.
-   - Use **Clean Journals** anytime to clean stray `0%` or un-ledgered duplicate `100%` journal artifacts while preserving all genuine reading sessions.
-   - Use **Compact Outbox** (or keep **Auto-compact after Sync All** enabled) to keep `events.jsonl` well under firmware's 4 KB outbox cap.
+   - Use **Clean Journals** (under **Tools & Preferences**, or **Clean Journal** inside any book's **Reading history** alongside **Open Journal ↗**) anytime to clean stray `0%` or un-ledgered duplicate `100%` journal artifacts while preserving all genuine reading sessions.
+   - Use **Compact Outbox** (under **Tools & Preferences**, or keep **Auto-compact after Sync All** enabled) to keep `events.jsonl` well under firmware's 4 KB outbox cap.
+   - Use **Import Session History** (under **Tools & Preferences**) anytime to import historical sessions from CrossPoint Sync exports, `reading-history.json`, or `events.jsonl`.
+4. **Badges to watch for:**
+   - **Journal unsynced:** Progress matches StoryGraph, but some reading sessions are not in the Reading Journal yet. These books appear under **Needs Sync** and are included in **Sync All**.
+   - **Needs reconciliation:** An interrupted journal post left more than one matching entry on StoryGraph. Open the book's **Reading history**, click **Open Journal ↗** to check, then click **Mark Synced** (the entry already exists, so nothing is posted) or **Retry** (queue the session again for the next sync).
 
 ---
 
@@ -100,6 +110,10 @@ python backfill_sd.py --write-sd
 
 ```text
 storygraph-sync/
+├── src/
+│   └── plugin.js                        # Readable source for the browser plugin UI
+├── scripts/
+│   └── build.mjs                        # Zero-dep builder -> storygraph-sync.crosspoint-plugin/plugin.js (<256 KB)
 ├── storygraph-sync.crosspoint-plugin/   # Installable Plugin Hub payload
 │   ├── manifest.json
 │   ├── device.json
@@ -117,9 +131,11 @@ storygraph-sync/
 
 ## Development & Tests
 
-Run the local mock CrossPoint + StoryGraph test suite (Node.js 18+, zero npm dependencies):
+Build `storygraph-sync.crosspoint-plugin/plugin.js` from `src/plugin.js` and run the local mock CrossPoint + StoryGraph test suite (Node.js 18+, zero npm dependencies):
 
 ```bash
+node scripts/build.mjs
+node --check src/plugin.js
 node --check storygraph-sync.crosspoint-plugin/plugin.js
 node --check harness/server.mjs
 node harness/test.mjs

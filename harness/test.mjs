@@ -205,6 +205,31 @@ async function runTests() {
   assert.equal(cm._storygraph_session, 's1');
   assert.equal(cm.remember_user_token, 'r1');
   assert.equal(cm.cf_clearance, 'cf1');
+
+  // 2a. Smart-paste cookie formats (Cookie-Editor JSON, Netscape cookies.txt, cURL, DevTools prefix)
+  const ceJson = sg.parseCookieHeader(JSON.stringify([
+    { name: '_storygraph_session', value: 'ce_sess', domain: 'app.thestorygraph.com' },
+    { name: 'cf_clearance', value: 'ce_cf', domain: '.thestorygraph.com' },
+    { name: 'unrelated', value: 'skip_me', domain: '.example.com' }
+  ]));
+  assert.deepEqual({ ...ceJson }, { _storygraph_session: 'ce_sess', cf_clearance: 'ce_cf' });
+
+  const devtoolsPrefixed = sg.parseCookieHeader('  cookie: "_storygraph_session=dt_sess; remember_user_token=dt_rem"  ');
+  assert.deepEqual({ ...devtoolsPrefixed }, { _storygraph_session: 'dt_sess', remember_user_token: 'dt_rem' });
+
+  const curlH = sg.parseCookieHeader("curl 'https://app.thestorygraph.com/' -H 'accept: text/html' -H 'cookie: _storygraph_session=curl_1; cf_clearance=curl_cf'");
+  assert.deepEqual({ ...curlH }, { _storygraph_session: 'curl_1', cf_clearance: 'curl_cf' });
+
+  const curlB = sg.parseCookieHeader('curl https://app.thestorygraph.com/ -b "_storygraph_session=curl_b1; cf_clearance=curl_b2"');
+  assert.deepEqual({ ...curlB }, { _storygraph_session: 'curl_b1', cf_clearance: 'curl_b2' });
+
+  const netscapeTxt = sg.parseCookieHeader([
+    '# Netscape HTTP Cookie File',
+    '#HttpOnly_app.thestorygraph.com\tFALSE\t/\tTRUE\t1893456000\t_storygraph_session\tns_sess',
+    '.thestorygraph.com\tTRUE\t/\tTRUE\t1893456000\tcf_clearance\tns_cf',
+    '.otherdomain.com\tTRUE\t/\tFALSE\t1893456000\tother\tskip'
+  ].join('\n'));
+  assert.deepEqual({ ...netscapeTxt }, { _storygraph_session: 'ns_sess', cf_clearance: 'ns_cf' });
   const rotated = sg.mergeSetCookieHeaders(cm, [
     ['Content-Type', 'text/javascript'],
     ['Set-Cookie', '_storygraph_session=s2; path=/; HttpOnly']
@@ -894,6 +919,16 @@ async function runTests() {
     assert.equal(pendingRows.length, 1);
     assert.equal(pendingRows[0].sdPath, '/a.epub');
 
+    // 7a. Unsynced journal sessions count as pending even when % is unchanged (but never for Read / 0% / unlinked)
+    const journalPending = sg.getPendingSyncRows([
+      { sdPath: '/j1.epub', devicePercent: 60, unsyncedJournalCount: 1, mapping: { bookId: 'j1', status: 'currently-reading', lastSyncedPercent: 60 } },
+      { sdPath: '/j2.epub', devicePercent: 60, unsyncedJournalCount: 0, mapping: { bookId: 'j2', status: 'currently-reading', lastSyncedPercent: 60 } },
+      { sdPath: '/j3.epub', devicePercent: 100, unsyncedJournalCount: 2, mapping: { bookId: 'j3', status: 'read', lastSyncedPercent: 100 } },
+      { sdPath: '/j4.epub', devicePercent: 0, unsyncedJournalCount: 1, mapping: { bookId: 'j4', status: 'currently-reading', lastSyncedPercent: 0 } },
+      { sdPath: '/j5.epub', devicePercent: 30, unsyncedJournalCount: 1, mapping: null }
+    ]);
+    assert.deepEqual(journalPending.map((r) => r.sdPath), ['/j1.epub']);
+
     // 7b. UI filter/classify/sort helper unit tests
     const uiRowsSample = [
       {
@@ -1461,7 +1496,7 @@ async function runTests() {
     assert.equal(mockContainer.querySelector('#sg-sign-in'), null, '#sg-sign-in must be removed');
     assert.equal(mockContainer.querySelector('#sg-login-email'), null, '#sg-login-email must be removed');
     assert.equal(mockContainer.querySelector('#sg-login-password'), null, '#sg-login-password must be removed');
-    assert.equal(cookieBadge.textContent, '_storygraph_session: missing');
+    assert.equal(cookieBadge.textContent, 'Not connected');
     assert.ok(!cookieBadge.textContent.includes('remember_user_token'));
 
     // Verify with empty cookies must show error in #sg-banner and unlock buttons
@@ -1477,7 +1512,7 @@ async function runTests() {
     // Pasting cookies updates badge without mentioning remember_user_token when absent
     cookieInput.value = '_storygraph_session=sess1; cf_clearance=cf1';
     await cookieInput.trigger('input');
-    assert.equal(cookieBadge.textContent, '_storygraph_session: set · +1 extra');
+    assert.equal(cookieBadge.textContent, 'Cookies saved (2) · click Verify');
     assert.ok(!cookieBadge.textContent.includes('remember_user_token'));
 
     // Verify hitting Cloudflare 403 must show error in #sg-banner and unlock verifyBtn
@@ -3051,6 +3086,42 @@ async function runTests() {
     assert.deepEqual(histAfterAmbig.books[lawsPath].sessions[0].candidateJournalEntryIds, ['je-ambig-a', 'je-ambig-b']);
     assert.ok(booksListEl.textContent.includes('Needs reconciliation'), 'Test 12: UI must display Needs reconciliation badge');
 
+    // Test 12b: Reconciliation actions (Open Journal link, Retry re-queues, Mark Synced binds a candidate without posting)
+    assert.ok(
+      booksListEl.querySelectorAll('a').some((a) => String(a.getAttribute('href') || '').includes('/journal?book_id=book-daily-laws')),
+      'Test 12b: Open Journal link must be rendered for books needing reconciliation'
+    );
+    const findReconBtn = (act) =>
+      booksListEl
+        .querySelectorAll('button')
+        .find((b) => b.getAttribute('data-act') === act && b.getAttribute('data-sid') === 's-interrupted-ambig');
+    confirmResult = true;
+    await booksListEl.trigger('click', { target: findReconBtn('recon-retry') });
+    await waitForLong(() => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled, 'Expected Retry to finish');
+    const histAfterRetry = JSON.parse(virtualFiles.get('reading-history.json').toString('utf8'));
+    assert.equal(histAfterRetry.books[lawsPath].sessions[0].syncStatus, 'pending', 'Test 12b: Retry must re-queue as pending');
+    assert.equal(histAfterRetry.books[lawsPath].sessions[0].candidateJournalEntryIds, null);
+    assert.ok(
+      booksListEl.querySelectorAll('button').some((b) => b.getAttribute('data-act') === 'sync-journal' && b.getAttribute('data-key') === lawsPath),
+      'Test 12b: Re-queued session must offer Sync Journal'
+    );
+    // Restore the ambiguous state, then resolve with Mark Synced
+    histAfterRetry.books[lawsPath].sessions[0].syncStatus = 'needs_reconciliation';
+    histAfterRetry.books[lawsPath].sessions[0].candidateJournalEntryIds = ['je-ambig-a', 'je-ambig-b'];
+    await mockApi.writeFile(
+      '/.crosspoint/plugins/storygraph-sync/reading-history.json',
+      Buffer.from(JSON.stringify(histAfterRetry), 'utf8').toString('base64')
+    );
+    await refreshBtn.trigger('click');
+    sgState.posts.length = 0;
+    await booksListEl.trigger('click', { target: findReconBtn('recon-mark') });
+    await waitForLong(() => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled, 'Expected Mark Synced to finish');
+    const histAfterMark = JSON.parse(virtualFiles.get('reading-history.json').toString('utf8'));
+    assert.equal(histAfterMark.books[lawsPath].sessions[0].syncStatus, 'synced', 'Test 12b: Mark Synced must set synced');
+    assert.equal(histAfterMark.books[lawsPath].sessions[0].journalEntryId, 'je-ambig-a', 'Test 12b: Mark Synced binds first unclaimed candidate');
+    assert.equal(sgState.posts.length, 0, 'Test 12b: Mark Synced must not post anything to StoryGraph');
+    assert.ok(!booksListEl.textContent.includes('Needs reconciliation'), 'Test 12b: badge must clear after Mark Synced');
+
     // Test 10 & 13: Final 100% reading session with duration note is posted, retained alongside Read status, and preserved by Clean Journals
     sgState.books['book-mt-9'].statusLabel = 'currently reading';
     sgState.books['book-mt-9'].lastReachedPercent = 76;
@@ -3595,6 +3666,134 @@ async function runTests() {
     assert.ok(fetchToSdCalls.some((c) => c.url.includes('book_id=book-done-100')), 'Test 8: Book 1 (pending) must be fetched');
     assert.ok(fetchToSdCalls.some((c) => c.url.includes('book_id=book-daily-stoic')), 'Test 8: Book 3 (needs_reconciliation) must be fetched');
     assert.ok(!fetchToSdCalls.some((c) => c.url.includes('book_id=book-mt-9')), 'Test 8: Clean synced Book 2 must remain skipped');
+
+    // Case 13: Tier 2 UI polish (session pill, header meter, cookie toggle, Tools drawer, history chevron/logged wording, single-book Clean Journal, file settings import, Enter key in linker)
+    const sessionPill = mockContainer.querySelector('#sg-session-pill');
+    const headerMeter = mockContainer.querySelector('#sg-header-meter');
+    const cookieToggle = mockContainer.querySelector('#sg-cookie-toggle');
+    const toolsDetails = mockContainer.querySelector('#sg-tools-details');
+    const toolsBadge = mockContainer.querySelector('#sg-tools-badge');
+    const settingsFile = mockContainer.querySelector('#sg-settings-file');
+    assert.ok(sessionPill && headerMeter && cookieToggle && toolsDetails && toolsBadge && settingsFile, 'Case 13: Tier 2 UI controls must render');
+    assert.ok(toolsDetails.querySelector('#sg-clean-journals') && toolsDetails.querySelector('#sg-compact') && toolsDetails.querySelector('#sg-auto-compact') && toolsDetails.querySelector('#sg-overwrite-lower'), 'Case 13: Maintenance tools & preferences live inside Tools & Preferences drawer');
+    assert.ok(headerMeter.textContent.includes('/ 4.0 KB'), `Case 13: Expected header meter text, got "${headerMeter.textContent}"`);
+    assert.equal(cookieToggle.textContent, 'Show');
+    await cookieToggle.trigger('click', { target: cookieToggle });
+    assert.equal(cookieInput.getAttribute('type'), 'text');
+    assert.equal(cookieToggle.textContent, 'Hide');
+    await cookieToggle.trigger('click', { target: cookieToggle });
+    assert.equal(cookieInput.getAttribute('type'), 'password');
+    assert.equal(cookieToggle.textContent, 'Show');
+
+    // Session pill transitions: Verified -> Cookies saved on edit -> Connected after Verify
+    await verifyBtn.trigger('click');
+    await waitForLong(() => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled, 'Case 13: Verify session');
+    assert.equal(sessionPill.textContent, 'Connected');
+    assert.ok(cookieBadge.textContent.includes('Connected'), `Case 13: Expected Connected in cookie badge, got "${cookieBadge.textContent}"`);
+    cookieInput.value = '_storygraph_session=edited_sess; cf_clearance=cf_ok';
+    await cookieInput.trigger('input', { target: cookieInput });
+    assert.equal(sessionPill.textContent, 'Cookies saved');
+
+    // Case 14: Account Settings friendliness (Cookie-Editor smart-paste normalization, help guide, live note preview, Clear Cookies confirmation, Advanced & Tools grouping)
+    const cookieHelp = mockContainer.querySelector('#sg-cookie-help');
+    const cookieHint = mockContainer.querySelector('#sg-cookie-hint');
+    const notePreview = mockContainer.querySelector('#sg-note-preview');
+    const advDetails = mockContainer.querySelector('#sg-advanced-details');
+    const clearCfgBtn = mockContainer.querySelector('#sg-clear-cfg');
+    assert.ok(cookieHelp && cookieHint && notePreview && advDetails && clearCfgBtn, 'Case 14: Account Settings controls must render');
+    assert.ok(cookieHelp.textContent.includes('Cookie-Editor') && cookieHelp.textContent.includes('F12'), 'Case 14: Setup guide must cover both Desktop and Phone');
+    assert.ok(advDetails.querySelector('#sg-ua-input') && advDetails.querySelector('#sg-export-cfg') && advDetails.querySelector('#sg-import-cfg'), 'Case 14: User-Agent and backup buttons live inside Advanced & Backup');
+    assert.ok(toolsDetails.querySelector('#sg-import-history') && toolsDetails.querySelector('#sg-history-import-box'), 'Case 14: Import Session History lives inside Tools & Preferences');
+
+    // Smart-paste Cookie-Editor JSON normalizes input and updates hint
+    cookieInput.value = JSON.stringify([
+      { name: '_storygraph_session', value: 'json_sess_1', domain: 'app.thestorygraph.com' },
+      { name: 'cf_clearance', value: 'json_cf_1', domain: '.thestorygraph.com' }
+    ]);
+    await cookieInput.trigger('input', { target: cookieInput });
+    assert.equal(cookieInput.value, '_storygraph_session=json_sess_1; cf_clearance=json_cf_1');
+    assert.ok(cookieHint.textContent.includes('Session cookie detected') && cookieHint.textContent.includes('cf_clearance included'), `Case 14: Expected cookie hint confirmation, got "${cookieHint.textContent}"`);
+
+    // Live Journal Note preview updates with device label and checkbox
+    const dlInput = mockContainer.querySelector('#sg-device-label');
+    dlInput.value = 'X4 Pro';
+    await dlInput.trigger('input', { target: dlInput });
+    assert.ok(notePreview.textContent.includes('33m read on X4 Pro'), `Case 14: Expected X4 Pro in note preview, got "${notePreview.textContent}"`);
+    journalNotesCheck.checked = false;
+    await journalNotesCheck.trigger('change', { target: journalNotesCheck });
+    assert.ok(notePreview.textContent.includes('blank'), `Case 14: Expected blank note preview when unchecked, got "${notePreview.textContent}"`);
+    journalNotesCheck.checked = true;
+    await journalNotesCheck.trigger('change', { target: journalNotesCheck });
+
+    // Clear Cookies respects confirmAction cancellation and clears when confirmed
+    confirmResult = false;
+    await clearCfgBtn.trigger('click');
+    assert.ok(cookieInput.value.includes('json_sess_1'), 'Case 14: Cancelling Clear Cookies must keep cookies');
+    confirmResult = true;
+    await clearCfgBtn.trigger('click');
+    assert.equal(cookieInput.value, '', 'Case 14: Confirming Clear Cookies must clear input');
+    assert.equal(cookieBadge.textContent, 'Not connected');
+
+    // Restore cookies for subsequent tests
+    cookieInput.value = '_storygraph_session=edited_sess; cf_clearance=cf_ok';
+    await cookieInput.trigger('input', { target: cookieInput });
+
+    // File-based settings import
+    await settingsFile.trigger('change', {
+      target: {
+        files: [{ text: async () => JSON.stringify({ cookieHeader: '_storygraph_session=imported_sess; cf_clearance=cf_ok', deviceLabel: 'X4 Pro' }) }]
+      }
+    });
+    assert.ok(cookieInput.value.includes('imported_sess'), 'Case 13: Settings file import must apply cookieHeader');
+    assert.equal(mockContainer.querySelector('#sg-device-label').value, 'X4 Pro');
+
+    // Reading history chevron label, Open Journal link (separate from a.sg-book-link), and single-book Clean Journal
+    assert.ok(booksListEl.querySelectorAll('.sg-history-label').length > 0, 'Case 13: Reading history summary must wrap label in .sg-history-label for chevron');
+    assert.ok(booksListEl.querySelectorAll('a.sg-journal-link').length > 0, 'Case 13: Linked books with history must render a.sg-journal-link');
+    assert.ok(!booksListEl.querySelectorAll('a.sg-book-link').some((a) => String(a.getAttribute('href') || '').includes('/journal?')), 'Case 13: Journal links must not pollute a.sg-book-link');
+
+    sgState.books['book-done-100'].journalEntries = [
+      { entryId: 'je-single-zero', date: '2026-11-22', percent: 0, pages: 0, pagesDelta: 0, totalPages: 280, note: '' },
+      { entryId: 'je-single-fin', date: '2026-11-22', statusKind: 'finished', isStatus: true, pagesDelta: 280, pages: 280, totalPages: 280 }
+    ];
+    fetchToSdCalls.length = 0;
+    const singleCleanBtn = booksListEl.querySelectorAll('button').find((b) => b.getAttribute('data-act') === 'clean-journal' && b.getAttribute('data-key') === donePath);
+    assert.ok(singleCleanBtn, 'Case 13: Per-book Clean Journal button must render');
+    await booksListEl.trigger('click', { target: singleCleanBtn });
+    await waitForLong(() => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled, 'Case 13: Single-book Clean Journal');
+    assert.equal(fetchToSdCalls.length, 1, 'Case 13: Single-book Clean Journal must scan only that 1 book');
+    assert.ok(bannerEl.textContent.includes('1 deleted'), `Case 13: Expected 1 deleted in banner, got "${bannerEl.textContent}"`);
+
+    // Logged vs total wording when book duration exceeds logged session duration
+    const bfWithHigherDur = {
+      version: 1,
+      books: {
+        [lawsPath]: { sdPath: lawsPath, title: 'Sample Non-Fiction A', percent: 89, durationSeconds: 1620, pagesTurned: 49, sessions: 5, startDate: '2026-10-20', lastDate: '2026-11-23' }
+      }
+    };
+    await mockApi.writeFile('/.crosspoint/plugins/storygraph-sync/backfill.json', Buffer.from(JSON.stringify(bfWithHigherDur), 'utf8').toString('base64'));
+    await mockApi.writeFile('/.crosspoint/plugins/storygraph-sync/reading-history.json', Buffer.from(JSON.stringify({
+      version: 2,
+      books: {
+        [lawsPath]: {
+          sessions: [{ sessionId: 'logged-s1', recordType: 'reading_session', date: '2026-11-23', startPercent: 88, endPercent: 89, durationSeconds: 72, syncStatus: 'synced', syncedToJournal: true }]
+        }
+      }
+    }), 'utf8').toString('base64'));
+    await refreshBtn.trigger('click');
+    const lawsLoggedDet = booksListEl.querySelectorAll('details').find((d) => d.getAttribute('data-history-key') === lawsPath);
+    assert.ok(lawsLoggedDet && lawsLoggedDet.textContent.includes('1m 12s logged'), `Case 13: Expected "1m 12s logged" when total book time exceeds logged sessions, got "${lawsLoggedDet && lawsLoggedDet.textContent}"`);
+
+    // Enter key inside inline Linker triggers direct link
+    const unlinkedKey = '/Books/Enter Key Test - Author Test.epub';
+    await mockApi.writeFile('/.crosspoint/plugins/storygraph-sync/events.jsonl', Buffer.from(JSON.stringify({ e: 'reader.exit', ts: 1795300000, vars: { book: unlinkedKey, percent: '15' } }) + '\n', 'utf8').toString('base64'));
+    await refreshBtn.trigger('click');
+    const openLinkerBtn = booksListEl.querySelectorAll('button').find((b) => b.getAttribute('data-act') === 'toggle-link' && b.getAttribute('data-key') === unlinkedKey);
+    await booksListEl.trigger('click', { target: openLinkerBtn });
+    const enterDirectInp = booksListEl.querySelectorAll('input').find((i) => i.getAttribute('data-role') === 'direct-id' && i.getAttribute('data-key') === unlinkedKey);
+    enterDirectInp.value = 'https://app.thestorygraph.com/books/book-enter-99';
+    await booksListEl.trigger('keydown', { key: 'Enter', target: enterDirectInp, preventDefault() {} });
+    await waitForLong(() => bannerEl.textContent.includes('book-enter-99'), 'Case 13: Enter key in direct-id input must link book');
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
