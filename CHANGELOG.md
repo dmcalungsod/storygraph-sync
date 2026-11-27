@@ -2,6 +2,18 @@
 
 All notable changes to **StoryGraph Sync for CrossPoint** are documented in this file.
 
+## [v1.0.2] - 2026-11-27
+
+### Added
+- **Centered floating progress modal (`#sg-sync-progress`):** Matches CrossInk's centered upload modal (`position: fixed` with blurred backdrop), showing live operation labels (`Connecting`, `Searching`, `Linking`, `Uploading`, `Syncing`, `Cleaning`, `Complete`, `Failed`, `Cancelled`), `0–100%` progress, shimmer animation, and `×` / backdrop dismissal across single-book, batch, verification, search, and linking operations.
+- **Safe batch Cancel (`#sg-sync-cancel`):** Multi-book batches (**Sync All**, **Sync Dates**, and **Clean Journals**) now include an active **Cancel** button that stops cleanly between books without leaving half-posted StoryGraph entries, preserving completed progress and cleanup watermarks.
+- **Ignore / Restore unwanted books:** Added **Ignore** on unlinked outbox cards to hide samples, manuals, or unwanted files in `storygraph-map.json` (`mapData.ignored`, matching by `sdPath`, `documentHash`, and normalized filename) without modifying SD files, plus **Tools & Preferences → Ignored Books** (**Restore** / **Restore All**) and **Browse SD Library** `Ignored` / `Restore` controls.
+
+### Changed
+- **Smooth book linking & navigation:** Opening **Link Book** no longer teleports `Unlinked & From SD` above `Currently Reading`, scrolls directly to and focuses the linking UI (and clears active `#sg-book-search` filters on **Add & Link**), adds an inline search spinner and empty-result feedback, and preserves typed search queries and the **Include audiobooks** toggle across searches.
+- **Two-tone animated per-book progress bars:** Layered bar styling distinguishes synced StoryGraph progress from unsynced device progress with smooth width transitions.
+- **Token-aware build compactor (`scripts/build.mjs`):** Zero-dependency token-level whitespace/newline compaction and safe adjacent string folding with built-in `vm.Script` syntax validation (~227 KB built, reclaiming ~35 KB headroom under CrossInk's 256 KB limit).
+
 ## [v1.0.1] - 2026-11-24
 
 ### Added

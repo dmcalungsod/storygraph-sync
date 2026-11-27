@@ -72,9 +72,10 @@ Because The StoryGraph does not offer a public API, the plugin signs requests us
    - **Current Reads** (one-click match from your StoryGraph shelf),
    - **Search StoryGraph** (`/browse`), or
    - **Book URL / ID** (`https://app.thestorygraph.com/books/<id>`).
+   - *(Optional)* Click **Ignore** on any unlinked sample, manual, or unwanted file to hide it without deleting files on your SD card (restore anytime under **Tools & Preferences → Ignored Books** or **Browse SD Library**).
 2. **Add older or already-finished books:** Expand **Browse SD Library**, navigate to a folder, and click **Add & Link**. Once linked, click **Mark Read** for finished books or leave them pre-linked for future sessions.
 3. **Sync progress & reading journal:**
-   - Click **Sync Now** on one book or **Sync All** in the header to push all pending reading sessions, progress updates, **Read** completions, and start/finish dates.
+   - Click **Sync Now** on one book or **Sync All** in the header to push all pending reading sessions, progress updates, **Read** completions, and start/finish dates. Multi-book batches (**Sync All**, **Sync Dates**, and **Clean Journals**) include a **Cancel** button on the progress dialog that stops cleanly after the current book finishes without leaving partial posts behind.
    - Each sitting is recorded individually in StoryGraph's **Reading Journal** (e.g. `20:10–20:55 · 45m read on CrossPoint`).
    - Use **Sync Dates** anytime to align start/finish dates for previously synced books.
    - Use **Clean Journals** (under **Tools & Preferences**, or **Clean Journal** inside any book's **Reading history** alongside **Open Journal ↗**) anytime to clean stray `0%` or un-ledgered duplicate `100%` journal artifacts while preserving all genuine reading sessions.

@@ -4,7 +4,7 @@
   "description": "Sync reading progress, per-session reading journals, and reading dates from CrossPoint to The StoryGraph.",
   "author": "D. Calungsod",
   "mount": "files",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "compatibility": {
     "firmware_family": [
       "crosspoint"

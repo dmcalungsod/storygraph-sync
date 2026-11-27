@@ -4,6 +4,7 @@ import path from 'node:path';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 import { createMockServer } from './server.mjs';
+import { compactSource } from '../scripts/build.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_JS_PATH = path.resolve(__dirname, '..', 'storygraph-sync.crosspoint-plugin', 'plugin.js');
@@ -173,6 +174,34 @@ class MiniDOMParser {
 }
 
 async function runTests() {
+  // 0. Builder compactSource safety tests (ASI, token spacing, template literals, string folding)
+  {
+    const asiSample = 'function f(){return\n{a:1}}\nconst o={a:1}\nconst b=2\nconst c=1/*\n*/const d=3';
+    const asiOut = compactSource(asiSample);
+    new vm.Script(asiOut);
+    const fnAsi = new Function(asiOut + ';return [f(), o.a, b, c, d];');
+    const asiRes = fnAsi();
+    assert.equal(asiRes[0], undefined, 'compactSource must preserve ASI after return\\n{...}');
+    assert.deepEqual(asiRes.slice(1), [1, 2, 1, 3], 'compactSource must preserve ASI after } and multiline /* */');
+
+    const spaceSample = 'const r=(a,b,c)=>[a + +b, a - -b, a++ + b, typeof /foo/g, c ? .5 : 1, (1) .toString(), 1 .toString()];';
+    const spaceOut = compactSource(spaceSample);
+    new vm.Script(spaceOut);
+    const rFn = new Function(spaceOut + ';return r(2,3,true);')();
+    assert.deepEqual(rFn, [5, 5, 5, 'object', 0.5, '1', '1'], 'compactSource must preserve required token spaces and ternary decimals');
+
+    const tplSample = 'const t=(x,y)=>`  keep\n  ${ x + y }  ` + `ok`;';
+    const tplOut = compactSource(tplSample);
+    new vm.Script(tplOut);
+    assert.equal(new Function(tplOut + ';return t(2,3);')(), '  keep\n  5  ok', 'compactSource must preserve template literal whitespace verbatim');
+
+    const foldSafe = compactSource("const s = 'a' +\n 'b' +\n 'c';");
+    assert.ok(foldSafe.includes("'abc'"), `compactSource must fold adjacent same-quote strings, got: ${foldSafe}`);
+    const foldUnsafe = compactSource("const n = 'a' + 'b'.length;");
+    assert.ok(!foldUnsafe.includes("'ab'.length"), `compactSource must NOT fold string followed by .length: ${foldUnsafe}`);
+    assert.equal(new Function(foldUnsafe + ';return n;')(), 'a1');
+  }
+
   let registeredPlugin = null;
   const code = await fs.readFile(PLUGIN_JS_PATH, 'utf8');
   const sandbox = {
@@ -1234,6 +1263,24 @@ async function runTests() {
     assert.equal(rsFileImp.importedSessions, 1);
     assert.equal(sg.getBookHistoryDays(rsFileImp.history, { sdPath: '/Books/Imported.epub' })[0].endPercent, 88);
 
+    // 7c. Ignore / unignore pure helpers (exact sdPath, moved normFilename, documentHash)
+    const ignMap = { version: 1, books: {} };
+    assert.equal(sg.isBookIgnored(ignMap, { sdPath: '/Samples/Guide.epub' }), false);
+    assert.equal(
+      sg.ignoreBookInMap(ignMap, {
+        sdPath: '/Samples/Guide.epub',
+        title: 'User Guide',
+        author: 'CrossInk',
+        documentHash: 'hash_guide_1'
+      }),
+      true
+    );
+    assert.equal(sg.isBookIgnored(ignMap, { sdPath: '/Samples/Guide.epub' }), true);
+    assert.equal(sg.isBookIgnored(ignMap, { sdPath: '/Docs/Guide.epub' }), true, 'normFilename fallback matches moved book');
+    assert.equal(sg.isBookIgnored(ignMap, { sdPath: '/Other/Renamed.epub', documentHash: 'hash_guide_1' }), true, 'documentHash fallback matches');
+    assert.equal(sg.unignoreBookInMap(ignMap, { sdPath: '/Docs/Guide.epub' }), true);
+    assert.equal(sg.isBookIgnored(ignMap, { sdPath: '/Samples/Guide.epub', documentHash: 'hash_guide_1' }), false);
+
     // 8. UI regression test: Browser cookie flow, cookie badge, and Cloudflare/empty-cookie errors
     class MockUiElement {
       constructor(tagName = 'div', attrs = {}, parent = null) {
@@ -1371,7 +1418,12 @@ async function runTests() {
           await fn(ev);
         }
       }
-      focus() {}
+      focus(opts) {
+        if (typeof MockUiElement.onFocus === 'function') MockUiElement.onFocus(this, opts);
+      }
+      scrollIntoView(opts) {
+        if (typeof MockUiElement.onScrollIntoView === 'function') MockUiElement.onScrollIntoView(this, opts);
+      }
       select() {}
       setSelectionRange() {}
     }
@@ -3823,6 +3875,391 @@ async function runTests() {
     enterDirectInp.value = 'https://app.thestorygraph.com/books/book-enter-99';
     await booksListEl.trigger('keydown', { key: 'Enter', target: enterDirectInp, preventDefault() {} });
     await waitForLong(() => bannerEl.textContent.includes('book-enter-99'), 'Case 13: Enter key in direct-id input must link book');
+
+    // Case 15: UI motion & smoothness — stable linker sections, search persistence, two-tone progress bars, and global progress bar states/dismiss
+    const smoothUnlinkedKey = '/Books/Smooth Link Test - Author Smooth.epub';
+    await mockApi.writeFile(
+      '/.crosspoint/plugins/storygraph-sync/events.jsonl',
+      Buffer.from(
+        [
+          JSON.stringify({ e: 'reader.exit', ts: 1795400000, vars: { book: lawsPath, percent: '89' } }),
+          JSON.stringify({ e: 'reader.exit', ts: 1795400010, vars: { book: smoothUnlinkedKey, percent: '40' } })
+        ].join('\n') + '\n',
+        'utf8'
+      ).toString('base64')
+    );
+    await mockApi.writeFile(
+      '/.crosspoint/plugins/storygraph-sync/storygraph-map.json',
+      Buffer.from(
+        JSON.stringify({
+          version: 1,
+          books: {
+            [lawsPath]: {
+              bookId: 'book-daily-laws',
+              title: 'Sample Non-Fiction A',
+              author: 'Author Alpha',
+              sdPath: lawsPath,
+              trackingMode: 'percentage',
+              pageCount: 464,
+              status: 'currently-reading',
+              lastSyncedPercent: 50,
+              lastSyncedAt: '2026-11-20T00:00:00.000Z'
+            }
+          }
+        }),
+        'utf8'
+      ).toString('base64')
+    );
+    await mockApi.writeFile(
+      '/.crosspoint/plugins/storygraph-sync/reading-history.json',
+      Buffer.from(JSON.stringify({ version: 2, books: {} }), 'utf8').toString('base64')
+    );
+    await refreshBtn.trigger('click');
+
+    // Ensure section order stays reading -> unlinked when opening/closing Linker on an outbox book
+    const secOrderBefore = booksListEl.querySelectorAll('details[data-section]').map((d) => d.getAttribute('data-section'));
+    assert.deepEqual(secOrderBefore.slice(0, 2), ['reading', 'unlinked'], 'Case 15: Reading section must appear before Unlinked');
+
+    const smoothToggleBtn = booksListEl.querySelectorAll('button').find(
+      (b) => b.getAttribute('data-act') === 'toggle-link' && b.getAttribute('data-key') === smoothUnlinkedKey
+    );
+    assert.ok(smoothToggleBtn, 'Case 15: Expected Link Book button for unlinked book');
+    await booksListEl.trigger('click', { target: smoothToggleBtn });
+
+    const secOrderAfter = booksListEl.querySelectorAll('details[data-section]').map((d) => d.getAttribute('data-section'));
+    assert.deepEqual(secOrderAfter.slice(0, 2), ['reading', 'unlinked'], 'Case 15: Opening Linker must not teleport Unlinked above Reading');
+
+    const smoothCard = booksListEl.querySelectorAll('.sg-book').find((el) => el.getAttribute('data-book-key') === smoothUnlinkedKey);
+    assert.ok(smoothCard && smoothCard.querySelector('.sg-linker'), 'Case 15: Book card must expose data-book-key and open inline linker');
+
+    // Empty search feedback + query & include-audio checkbox persistence
+    const smoothSearchInp = smoothCard.querySelectorAll('input').find((i) => i.getAttribute('data-role') === 'search-q');
+    const smoothSearchBtn = smoothCard.querySelectorAll('button').find((b) => b.getAttribute('data-act') === 'search');
+    smoothSearchInp.value = 'nonexistent-xyz';
+    await booksListEl.trigger('input', { target: smoothSearchInp });
+    await booksListEl.trigger('click', { target: smoothSearchBtn });
+    await waitForLong(() => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled, 'Case 15: Empty search finished');
+
+    const smoothCardAfterEmpty = booksListEl.querySelectorAll('.sg-book').find((el) => el.getAttribute('data-book-key') === smoothUnlinkedKey);
+    assert.ok(smoothCardAfterEmpty.textContent.includes('No matching editions found'), 'Case 15: Empty search must render clear feedback');
+    const persistedSearchInp = smoothCardAfterEmpty.querySelectorAll('input').find((i) => i.getAttribute('data-role') === 'search-q');
+    assert.equal(persistedSearchInp.value, 'nonexistent-xyz', 'Case 15: Typed search query must persist after re-render');
+
+    const smoothAudioCb = smoothCardAfterEmpty.querySelectorAll('input').find((i) => i.getAttribute('data-role') === 'include-audio');
+    smoothAudioCb.checked = true;
+    await booksListEl.trigger('change', { target: smoothAudioCb });
+    const smoothSearchBtn2 = smoothCardAfterEmpty.querySelectorAll('button').find((b) => b.getAttribute('data-act') === 'search');
+    await booksListEl.trigger('click', { target: smoothSearchBtn2 });
+    await waitForLong(() => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled, 'Case 15: Audiobook search finished');
+
+    const smoothCardAfterAudio = booksListEl.querySelectorAll('.sg-book').find((el) => el.getAttribute('data-book-key') === smoothUnlinkedKey);
+    assert.ok(smoothCardAfterAudio.textContent.includes('Audio Edition Example'), 'Case 15: Search with Include audiobooks must return audiobook result');
+    const persistedAudioCb = smoothCardAfterAudio.querySelectorAll('input').find((i) => i.getAttribute('data-role') === 'include-audio');
+    assert.equal(persistedAudioCb.checked, true, 'Case 15: Include audiobooks checkbox state must persist');
+
+    // Two-tone per-book progress bar (ahead vs synced)
+    const lawsCardBefore = booksListEl.querySelectorAll('.sg-book').find((el) => el.getAttribute('data-book-key') === lawsPath);
+    const lawsFillBefore = lawsCardBefore.querySelector('.sg-progress-fill');
+    const lawsSyncedBefore = lawsCardBefore.querySelector('.sg-progress-synced');
+    assert.ok(lawsFillBefore && lawsSyncedBefore, 'Case 15: Linked book must render two-tone progress bar');
+    assert.ok(lawsFillBefore.classList.contains('sg-progress-ahead'), 'Case 15: Device ahead of synced must mark .sg-progress-ahead');
+    assert.equal(lawsFillBefore.style.width, '89%');
+    assert.equal(lawsSyncedBefore.style.width, '50%');
+
+    // Global progress bar .done state, #sg-sync-pct, and #sg-sync-dismiss
+    const syncPctEl = mockContainer.querySelector('#sg-sync-pct');
+    const syncDismissBtn = mockContainer.querySelector('#sg-sync-dismiss');
+    assert.ok(syncPctEl && syncDismissBtn, 'Case 15: #sg-sync-pct and #sg-sync-dismiss must render');
+    sgState.books['book-daily-laws'].lastReachedPercent = 50;
+    await syncAllBtn.trigger('click');
+    await waitForLong(() => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled && bannerEl.className.includes('sg-ok'), 'Case 15: Sync All done');
+    assert.equal(syncProgEl.classList.contains('show'), true);
+    assert.equal(syncProgEl.classList.contains('done'), true, 'Case 15: Completed progress bar must have .done');
+    assert.equal(syncProgEl.classList.contains('err'), false);
+    assert.equal(syncPctEl.textContent, '100%');
+    assert.equal(syncFillEl.style.width, '100%');
+
+    const lawsCardAfter = booksListEl.querySelectorAll('.sg-book').find((el) => el.getAttribute('data-book-key') === lawsPath);
+    assert.equal(lawsCardAfter.querySelector('.sg-progress-fill').classList.contains('sg-progress-ahead'), false, 'Case 15: Caught-up bar must clear .sg-progress-ahead');
+    assert.equal(lawsCardAfter.querySelector('.sg-progress-synced').style.width, '89%');
+
+    await syncDismissBtn.trigger('click');
+    assert.equal(syncProgEl.classList.contains('show'), false, 'Case 15: Dismiss button must hide progress bar');
+
+    // Global progress bar .err state on batch failure
+    await mockApi.writeFile(
+      '/.crosspoint/plugins/storygraph-sync/storygraph-map.json',
+      Buffer.from(
+        JSON.stringify({
+          version: 1,
+          books: {
+            [lawsPath]: {
+              bookId: 'book-daily-laws',
+              title: 'Sample Non-Fiction A',
+              author: 'Author Alpha',
+              sdPath: lawsPath,
+              trackingMode: 'percentage',
+              pageCount: 464,
+              status: 'currently-reading',
+              lastSyncedPercent: 40,
+              lastSyncedAt: '2026-11-20T00:00:00.000Z'
+            }
+          }
+        }),
+        'utf8'
+      ).toString('base64')
+    );
+    await refreshBtn.trigger('click');
+    forceCloudflare = true;
+    await syncAllBtn.trigger('click');
+    await waitForLong(() => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled && bannerEl.className.includes('sg-err'), 'Case 15: Sync All error state');
+    forceCloudflare = false;
+    assert.equal(syncProgEl.classList.contains('show'), true);
+    assert.equal(syncProgEl.classList.contains('err'), true, 'Case 15: Failed batch progress bar must have .err');
+    assert.equal(syncProgEl.classList.contains('done'), false);
+    await syncDismissBtn.trigger('click');
+    assert.equal(syncProgEl.classList.contains('show'), false);
+
+    // Case 16: Floating progress bar (#sg-sync-op states + fixed overlay CSS) and Linker auto-scroll/focus navigation
+    const builtSource = await fs.readFile(PLUGIN_JS_PATH, 'utf8');
+    assert.ok(builtSource.includes('.sg-sync-prog{position:fixed;'), 'Case 16: Floating progress bar must use position:fixed');
+
+    const syncOpEl = mockContainer.querySelector('#sg-sync-op');
+    assert.ok(syncOpEl, 'Case 16: #sg-sync-op label must render');
+
+    // Verify Session updates floating progress bar to Connecting -> Connected
+    await verifyBtn.trigger('click');
+    await waitForLong(() => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled, 'Case 16: Verify session');
+    assert.equal(syncProgEl.classList.contains('show'), true);
+    assert.equal(syncProgEl.classList.contains('done'), true);
+    assert.equal(syncOpEl.textContent, 'Connected');
+    assert.equal(syncPctEl.textContent, '100%');
+
+    // Verify Session error updates floating progress bar to Connection failed (.err)
+    forceCloudflare = true;
+    await verifyBtn.trigger('click');
+    await waitForLong(() => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled && bannerEl.className.includes('sg-err'), 'Case 16: Verify session error');
+    forceCloudflare = false;
+    assert.equal(syncProgEl.classList.contains('show'), true);
+    assert.equal(syncProgEl.classList.contains('err'), true);
+    assert.equal(syncOpEl.textContent, 'Connection failed');
+    await syncDismissBtn.trigger('click');
+
+    // Ensure linker starts closed before testing Link Book navigation
+    const preOpenBtn16 = booksListEl.querySelectorAll('button').find(
+      (b) => b.getAttribute('data-act') === 'toggle-link' && b.getAttribute('data-key') === smoothUnlinkedKey
+    );
+    if (preOpenBtn16 && preOpenBtn16.textContent === 'Close Linker') {
+      await booksListEl.trigger('click', { target: preOpenBtn16 });
+    }
+
+    // Link Book button navigates/scrolls directly to linking UI, highlights card, and focuses search input
+    const scrollEvents = [];
+    const focusEvents = [];
+    MockUiElement.onScrollIntoView = (el, opts) => scrollEvents.push({ key: el.getAttribute('data-book-key'), cls: el.className, opts });
+    MockUiElement.onFocus = (el, opts) => focusEvents.push({ role: el.getAttribute('data-role'), key: el.getAttribute('data-key'), opts });
+    try {
+      const linkBtn16 = booksListEl.querySelectorAll('button').find(
+        (b) => b.getAttribute('data-act') === 'toggle-link' && b.getAttribute('data-key') === smoothUnlinkedKey
+      );
+      assert.ok(linkBtn16, 'Case 16: Expected Link Book button');
+      await booksListEl.trigger('click', { target: linkBtn16 });
+
+      const activeCard16 = booksListEl.querySelectorAll('.sg-book').find((el) => el.getAttribute('data-book-key') === smoothUnlinkedKey);
+      assert.ok(activeCard16 && activeCard16.classList.contains('sg-linking'), 'Case 16: Active linking card must have .sg-linking');
+      assert.ok(activeCard16.querySelector('.sg-linker-head'), 'Case 16: Linker must render .sg-linker-head');
+      assert.ok(scrollEvents.some((ev) => ev.key === smoothUnlinkedKey), 'Case 16: Clicking Link Book must scroll linking card into view');
+      assert.ok(focusEvents.some((ev) => ev.role === 'search-q' && ev.key === smoothUnlinkedKey), 'Case 16: Clicking Link Book must focus linking search input');
+
+      // Searching updates floating progress bar -> Search complete
+      const searchBtn16 = activeCard16.querySelectorAll('button').find((b) => b.getAttribute('data-act') === 'search');
+      const searchInp16 = activeCard16.querySelectorAll('input').find((i) => i.getAttribute('data-role') === 'search-q');
+      searchInp16.value = 'Non-Fiction A';
+      await booksListEl.trigger('input', { target: searchInp16 });
+      await booksListEl.trigger('click', { target: searchBtn16 });
+      await waitForLong(() => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled, 'Case 16: Linker search finished');
+      assert.equal(syncProgEl.classList.contains('done'), true);
+      assert.equal(syncOpEl.textContent, 'Search complete');
+
+      // Linking an edition updates floating progress bar -> Linked and scrolls to linked card
+      scrollEvents.length = 0;
+      const pickBtn16 = booksListEl.querySelectorAll('button').find(
+        (b) => b.getAttribute('data-act') === 'pick-res' && b.getAttribute('data-key') === smoothUnlinkedKey
+      );
+      assert.ok(pickBtn16, 'Case 16: Expected Link result button');
+      await booksListEl.trigger('click', { target: pickBtn16 });
+      await waitForLong(() => syncOpEl.textContent === 'Linked', 'Case 16: Expected Linked op label');
+      assert.equal(syncProgEl.classList.contains('done'), true);
+      assert.ok(scrollEvents.some((ev) => ev.key === smoothUnlinkedKey), 'Case 16: Linking must scroll linked card into view');
+
+      // Add & Link from Browse SD Library clears active book search filter, opens linker, scrolls & focuses
+      const bookSearchInp16 = mockContainer.querySelector('#sg-book-search');
+      bookSearchInp16.value = 'filter-that-hides-everything';
+      await bookSearchInp16.trigger('input', { target: bookSearchInp16 });
+      assert.ok(booksListEl.textContent.includes('No books match'), 'Case 16: Search filter hides unrelated books');
+
+      scrollEvents.length = 0;
+      focusEvents.length = 0;
+      const addBookBtn16 = sdBrowserEl.querySelectorAll('button').find((b) => b.getAttribute('data-sd-act') === 'add-book');
+      assert.ok(addBookBtn16, 'Case 16: Expected Add & Link button in SD browser');
+      const sdTargetKey16 = addBookBtn16.getAttribute('data-path');
+      await sdBrowserEl.trigger('click', { target: addBookBtn16 });
+      assert.equal(bookSearchInp16.value, '', 'Case 16: Add & Link must clear active book search filter');
+      const sdCard16 = booksListEl.querySelectorAll('.sg-book').find((el) => el.getAttribute('data-book-key') === sdTargetKey16);
+      assert.ok(sdCard16 && sdCard16.classList.contains('sg-linking') && sdCard16.querySelector('.sg-linker'), 'Case 16: Add & Link must show and highlight linking UI');
+      assert.ok(scrollEvents.some((ev) => ev.key === sdTargetKey16), 'Case 16: Add & Link must scroll linking UI into view');
+      assert.ok(focusEvents.some((ev) => ev.role === 'search-q' && ev.key === sdTargetKey16), 'Case 16: Add & Link must focus linking search input');
+
+      const removeStagedBtn16 = sdCard16.querySelectorAll('button').find((b) => b.getAttribute('data-act') === 'remove-staged');
+      if (removeStagedBtn16) {
+        await booksListEl.trigger('click', { target: removeStagedBtn16 });
+      }
+    } finally {
+      MockUiElement.onScrollIntoView = null;
+      MockUiElement.onFocus = null;
+    }
+
+    // Case 17: Ignore / Restore unwanted unlinked books & Safe Cancel for batch operations
+    const ignSampleKey = '/Books/Dune - Frank Herbert.epub';
+    await mockApi.writeFile(
+      '/.crosspoint/plugins/storygraph-sync/events.jsonl',
+      Buffer.from(
+        [
+          JSON.stringify({ e: 'reader.exit', ts: 1795500000, vars: { book: lawsPath, percent: '89' } }),
+          JSON.stringify({ e: 'reader.exit', ts: 1795500005, vars: { book: stoicPath, percent: '83' } }),
+          JSON.stringify({ e: 'reader.exit', ts: 1795500010, vars: { book: ignSampleKey, percent: '5' } })
+        ].join('\n') + '\n',
+        'utf8'
+      ).toString('base64')
+    );
+    await mockApi.writeFile(
+      '/.crosspoint/plugins/storygraph-sync/storygraph-map.json',
+      Buffer.from(
+        JSON.stringify({
+          version: 1,
+          books: {
+            [lawsPath]: {
+              bookId: 'book-daily-laws',
+              title: 'Sample Non-Fiction A',
+              author: 'Author Alpha',
+              sdPath: lawsPath,
+              trackingMode: 'percentage',
+              pageCount: 464,
+              status: 'currently-reading',
+              lastSyncedPercent: 40,
+              lastSyncedAt: '2026-11-20T00:00:00.000Z'
+            },
+            [stoicPath]: {
+              bookId: 'book-daily-stoic',
+              title: 'Sample Non-Fiction B',
+              author: 'Author Beta',
+              sdPath: stoicPath,
+              trackingMode: 'pages',
+              pageCount: 416,
+              status: 'currently-reading',
+              lastSyncedPercent: 40,
+              lastSyncedAt: '2026-11-20T00:00:00.000Z'
+            }
+          }
+        }),
+        'utf8'
+      ).toString('base64')
+    );
+    await refreshBtn.trigger('click');
+
+    // Ignore an unlinked outbox book -> hidden from list, decrements Unlinked tab, appears in Tools & Preferences + SD Browser
+    assert.equal(getTab('unlinked').textContent, 'Unlinked (1)');
+    const ignoreBtn17 = booksListEl.querySelectorAll('button').find(
+      (b) => b.getAttribute('data-act') === 'ignore-book' && b.getAttribute('data-key') === ignSampleKey
+    );
+    assert.ok(ignoreBtn17, 'Case 17: Unlinked outbox book must render Ignore button');
+    await booksListEl.trigger('click', { target: ignoreBtn17 });
+    await waitForLong(() => getTab('unlinked').textContent === 'Unlinked (0)', 'Case 17: Ignoring must hide book and update Unlinked count');
+    assert.ok(!booksListEl.textContent.includes('Dune'), 'Case 17: Ignored book must not render in main book list');
+
+    const ignoredCountEl = mockContainer.querySelector('#sg-ignored-count');
+    const ignoredListEl = mockContainer.querySelector('#sg-ignored-list');
+    assert.equal(ignoredCountEl.textContent, '(1)');
+    assert.ok(ignoredListEl.textContent.includes('Dune'), 'Case 17: Ignored book must appear inside Ignored Books drawer');
+    assert.ok(toolsBadge.textContent.includes('1 ignored'), 'Case 17: Tools badge must show ignored count');
+
+    const savedMapAfterIgn = JSON.parse((await nodeFetch(`${base}/plugin?name=storygraph-sync&file=storygraph-map.json`)).status === 200
+      ? await (await nodeFetch(`${base}/plugin?name=storygraph-sync&file=storygraph-map.json`)).text()
+      : '{}');
+    assert.ok(savedMapAfterIgn.ignored && savedMapAfterIgn.ignored[ignSampleKey], 'Case 17: Ignored book must persist in storygraph-map.json');
+
+    // SD browser shows Ignored badge + Restore button
+    const sdRestoreBtn17 = sdBrowserEl.querySelectorAll('button').find(
+      (b) => b.getAttribute('data-sd-act') === 'unignore-book' && b.getAttribute('data-path') === ignSampleKey
+    );
+    assert.ok(sdRestoreBtn17 && sdBrowserEl.textContent.includes('Ignored'), 'Case 17: SD browser must show Ignored + Restore button');
+
+    // Restore from Tools & Preferences -> Ignored Books
+    const drawerRestoreBtn17 = ignoredListEl.querySelectorAll('button').find(
+      (b) => b.getAttribute('data-ign-act') === 'restore' && b.getAttribute('data-path') === ignSampleKey
+    );
+    assert.ok(drawerRestoreBtn17, 'Case 17: Ignored Books drawer must render Restore button');
+    await ignoredListEl.trigger('click', { target: drawerRestoreBtn17 });
+    await waitForLong(() => getTab('unlinked').textContent === 'Unlinked (1)', 'Case 17: Restoring must bring book back to Unlinked');
+    assert.equal(ignoredCountEl.textContent, '(0)');
+    assert.ok(booksListEl.textContent.includes('Dune'));
+
+    // Safe batch Cancel during 2-book Sync All
+    const syncCancelBtn = mockContainer.querySelector('#sg-sync-cancel');
+    assert.ok(syncCancelBtn, 'Case 17: #sg-sync-cancel button must render');
+    sgState.books['book-daily-laws'].lastReachedPercent = 40;
+    sgState.books['book-daily-stoic'].lastReachedPercent = 40;
+    fetchToSdCalls.length = 0;
+    let cancelTriggeredInSync = false;
+    fetchToSdInterceptor = async () => {
+      if (!cancelTriggeredInSync) {
+        cancelTriggeredInSync = true;
+        assert.equal(syncProgEl.classList.contains('cancellable'), true, 'Case 17: Batch progress modal must be cancellable');
+        assert.equal(syncCancelBtn.disabled, false, 'Case 17: Cancel button must stay enabled while busyLock is active');
+        await syncCancelBtn.trigger('click');
+        assert.equal(syncCancelBtn.disabled, true, 'Case 17: Cancel button must disable after click');
+        assert.equal(syncOpEl.textContent, 'Cancelling…');
+      }
+      return undefined;
+    };
+    try {
+      await syncAllBtn.trigger('click');
+      await waitForLong(() => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled, 'Case 17: Cancelled Sync All finished');
+    } finally {
+      fetchToSdInterceptor = null;
+    }
+    assert.equal(fetchToSdCalls.length, 1, 'Case 17: Cancelling during book 1 must stop before book 2 starts');
+    assert.equal(syncProgEl.classList.contains('show'), true);
+    assert.equal(syncProgEl.classList.contains('cancelled'), true, 'Case 17: Cancelled progress bar must have .cancelled');
+    assert.equal(syncProgEl.classList.contains('active'), false);
+    assert.equal(syncOpEl.textContent, 'Cancelled');
+    assert.ok(syncTextEl.textContent.includes('Cancelled after 1/2'), `Case 17: Expected partial summary, got "${syncTextEl.textContent}"`);
+    assert.ok(bannerEl.textContent.includes('Sync All cancelled'), `Case 17: Expected cancelled banner, got "${bannerEl.textContent}"`);
+    await syncDismissBtn.trigger('click');
+    assert.equal(syncProgEl.classList.contains('show'), false);
+
+    // Safe batch Cancel during 2-book Clean Journals
+    const cleanJournalsBtn17 = mockContainer.querySelector('#sg-clean-journals');
+    fetchToSdCalls.length = 0;
+    let cancelTriggeredInClean = false;
+    fetchToSdInterceptor = async () => {
+      if (!cancelTriggeredInClean) {
+        cancelTriggeredInClean = true;
+        assert.equal(syncCancelBtn.disabled, false);
+        await syncCancelBtn.trigger('click');
+      }
+      return undefined;
+    };
+    try {
+      await cleanJournalsBtn17.trigger('click');
+      await waitForLong(() => !wrapEl.classList.contains('sg-busy') && !verifyBtn.disabled, 'Case 17: Cancelled Clean Journals finished');
+    } finally {
+      fetchToSdInterceptor = null;
+    }
+    assert.equal(fetchToSdCalls.length, 1, 'Case 17: Cancelling Clean Journals during book 1 must stop before book 2');
+    assert.equal(syncProgEl.classList.contains('cancelled'), true);
+    assert.equal(syncOpEl.textContent, 'Cancelled');
+    await syncDismissBtn.trigger('click');
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

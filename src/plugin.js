@@ -1,4 +1,4 @@
-// StoryGraph Sync — CrossPoint / CrossInk Browser Plugin (v1.0.1)
+// StoryGraph Sync — CrossPoint / CrossInk Browser Plugin (v1.0.2)
 // Subscribes to reader.exit / reader.session via device.json -> events.jsonl,
 // fetches StoryGraph HTML via api.fetchToSd(), and submits form updates via api.relay().
 (function () {
@@ -2904,6 +2904,66 @@
     });
   }
 
+  function isBookIgnored(map, book) {
+    const ignored = map && map.ignored && typeof map.ignored === 'object' ? map.ignored : null;
+    if (!ignored || !book) return false;
+    const sdPath = String(book.sdPath || book.key || '');
+    const hash = String(book.documentHash || '');
+    const normFn = book.normFilename || (sdPath ? extractFilenameMeta(sdPath).normFilename : '');
+    if (sdPath && ignored[sdPath]) return true;
+    for (const [k, entry] of Object.entries(ignored)) {
+      if (!entry || typeof entry !== 'object') continue;
+      const ePath = String(entry.sdPath || k || '');
+      if (sdPath && ePath === sdPath) return true;
+      if (hash && entry.documentHash && entry.documentHash === hash) return true;
+      if (normFn && entry.normFilename && entry.normFilename === normFn) return true;
+    }
+    return false;
+  }
+
+  function ignoreBookInMap(map, book) {
+    if (!map || typeof map !== 'object' || !book) return false;
+    const sdPath = String(book.sdPath || book.key || '');
+    if (!sdPath) return false;
+    if (!map.ignored || typeof map.ignored !== 'object') map.ignored = {};
+    const meta = extractFilenameMeta(sdPath);
+    map.ignored[sdPath] = {
+      sdPath,
+      title: book.title || meta.title,
+      author: book.author || meta.author || '',
+      normFilename: book.normFilename || meta.normFilename || '',
+      documentHash: book.documentHash || '',
+      ignoredAt: new Date().toISOString()
+    };
+    return true;
+  }
+
+  function unignoreBookInMap(map, target) {
+    const ignored = map && map.ignored && typeof map.ignored === 'object' ? map.ignored : null;
+    if (!ignored || !target) return false;
+    const sdPath = typeof target === 'string' ? target : String(target.sdPath || target.key || '');
+    const hash = typeof target === 'object' ? String(target.documentHash || '') : '';
+    const normFn =
+      typeof target === 'object' && target.normFilename
+        ? target.normFilename
+        : sdPath
+          ? extractFilenameMeta(sdPath).normFilename
+          : '';
+    let removed = false;
+    for (const [k, entry] of Object.entries(ignored)) {
+      const ePath = entry && typeof entry === 'object' ? String(entry.sdPath || k || '') : k;
+      if (
+        (sdPath && (k === sdPath || ePath === sdPath)) ||
+        (hash && entry && entry.documentHash === hash) ||
+        (normFn && entry && entry.normFilename === normFn)
+      ) {
+        delete ignored[k];
+        removed = true;
+      }
+    }
+    return removed;
+  }
+
   if (typeof globalThis !== 'undefined') {
     globalThis.__StoryGraphSync = {
       pluginPath,
@@ -2981,7 +3041,10 @@
       isBookFileEntry,
       joinSdPath,
       parentSdPath,
-      filterAndSortSdEntries
+      filterAndSortSdEntries,
+      isBookIgnored,
+      ignoreBookInMap,
+      unignoreBookInMap
     };
   }
 
@@ -3017,6 +3080,22 @@
     let sessionVerified = false;
     let activeLinkKey = null;
     let searchResultsByKey = Object.create(null);
+    const searchQueryByKey = Object.create(null);
+    const includeAudioByKey = Object.create(null);
+    const renderedBarPctByKey = Object.create(null);
+    let searchingKey = null;
+    let linkerEnterKey = null;
+    let resultsEnterKey = null;
+    let flashKey = null;
+    const syncProgState = {
+      display: 0,
+      real: 0,
+      finished: true,
+      creepTimer: null,
+      autoHideTimer: null,
+      cancellable: false,
+      cancelRequested: false
+    };
     let busyLock = false;
     let activeFilter = 'all';
     let bookSearchQuery = '';
@@ -3131,33 +3210,173 @@
       }
     }
 
-    function setSyncProgress(percent, text) {
+    function stopSyncCreep() {
+      if (syncProgState.creepTimer) {
+        clearTimeout(syncProgState.creepTimer);
+        syncProgState.creepTimer = null;
+      }
+    }
+
+    function stopSyncAutoHide() {
+      if (syncProgState.autoHideTimer) {
+        clearTimeout(syncProgState.autoHideTimer);
+        syncProgState.autoHideTimer = null;
+      }
+    }
+
+    function scheduleSyncAutoHide(ms) {
+      stopSyncAutoHide();
+      if (typeof setTimeout !== 'function') return;
+      const t = setTimeout(() => {
+        syncProgState.autoHideTimer = null;
+        if (syncProgState.finished) hideSyncProgress();
+      }, ms);
+      if (t && typeof t.unref === 'function') t.unref();
+      syncProgState.autoHideTimer = t;
+    }
+
+    function applySyncFillWidth(fill, pct, instant) {
+      if (!fill || !fill.style) return;
+      if (instant && fill.classList) {
+        fill.classList.add('sg-no-anim');
+        fill.style.width = `${pct}%`;
+        void fill.offsetWidth;
+        fill.classList.remove('sg-no-anim');
+      } else {
+        fill.style.width = `${pct}%`;
+      }
+    }
+
+    function scheduleSyncCreep() {
+      stopSyncCreep();
+      if (typeof setTimeout !== 'function') return;
+      const t = setTimeout(() => {
+        syncProgState.creepTimer = null;
+        if (syncProgState.finished) return;
+        const ceil = Math.min(99, syncProgState.real + Math.min(6, (100 - syncProgState.real) / 4));
+        if (syncProgState.display >= ceil - 0.2) return;
+        syncProgState.display += (ceil - syncProgState.display) * 0.15;
+        applySyncFillWidth(container.querySelector('#sg-sync-fill'), Math.round(syncProgState.display * 10) / 10, false);
+        scheduleSyncCreep();
+      }, 700);
+      if (t && typeof t.unref === 'function') t.unref();
+      syncProgState.creepTimer = t;
+    }
+
+    function beginBatchCancelScope() {
+      syncProgState.cancellable = true;
+      syncProgState.cancelRequested = false;
+      const box = container.querySelector('#sg-sync-progress');
+      if (box) box.classList.add('cancellable');
+      const btn = container.querySelector('#sg-sync-cancel');
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = 'Cancel';
+      }
+    }
+
+    function endBatchCancelScope() {
+      syncProgState.cancellable = false;
+      syncProgState.cancelRequested = false;
+      const box = container.querySelector('#sg-sync-progress');
+      if (box) box.classList.remove('cancellable');
+      const btn = container.querySelector('#sg-sync-cancel');
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = 'Cancel';
+      }
+    }
+
+    function requestBatchCancel() {
+      if (!syncProgState.cancellable || syncProgState.cancelRequested) return;
+      syncProgState.cancelRequested = true;
+      const btn = container.querySelector('#sg-sync-cancel');
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Cancelling…';
+      }
+      const opEl = container.querySelector('#sg-sync-op');
+      if (opEl) opEl.textContent = 'Cancelling…';
+      const label = container.querySelector('#sg-sync-text');
+      if (label && label.textContent && !label.textContent.includes('stopping after current book')) {
+        label.textContent += ' — stopping after current book...';
+      }
+    }
+
+    function inferSyncOpLabel(text, isDone, isErr, isCancelled) {
+      if (isCancelled) return 'Cancelled';
+      if (isErr) return 'Failed';
+      if (isDone) return 'Complete';
+      const lower = String(text || '').trim().toLowerCase();
+      if (/^(checking|connecting)/.test(lower)) return 'Connecting';
+      if (/^searching/.test(lower)) return 'Searching';
+      if (/^linking/.test(lower)) return 'Linking';
+      if (/^(cleaning|scanning)/.test(lower)) return 'Cleaning';
+      if (/^(marking|posting|updating|saving)/.test(lower)) return 'Uploading';
+      return 'Syncing';
+    }
+
+    function setSyncProgress(percent, text, state, opLabel) {
+      stopSyncAutoHide();
       const box = container.querySelector('#sg-sync-progress');
       const fill = container.querySelector('#sg-sync-fill');
       const label = container.querySelector('#sg-sync-text');
+      const pctEl = container.querySelector('#sg-sync-pct');
+      const opEl = container.querySelector('#sg-sync-op');
       const pct = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
+      const isErr = state === 'err';
+      const isCancelled = state === 'cancelled';
+      const isDone = !isErr && !isCancelled && (state === 'done' || pct >= 100);
+      const startingNew = syncProgState.finished || !box || !box.classList.contains('show');
+      if (startingNew) {
+        syncProgState.display = 0;
+        applySyncFillWidth(fill, 0, true);
+      }
+      syncProgState.real = pct;
+      syncProgState.finished = isDone || isErr || isCancelled;
+      if (pct >= syncProgState.display || syncProgState.finished) syncProgState.display = pct;
       if (box) {
         box.classList.add('show');
+        box.classList.toggle('active', !syncProgState.finished);
+        box.classList.toggle('done', isDone);
+        box.classList.toggle('err', isErr);
+        box.classList.toggle('cancelled', isCancelled);
         if (typeof box.setAttribute === 'function') {
           box.setAttribute('aria-valuenow', String(pct));
+          box.setAttribute('aria-hidden', 'false');
         }
       }
-      if (fill) fill.style.width = `${pct}%`;
-      if (label) label.textContent = String(text || '');
+      applySyncFillWidth(fill, syncProgState.display, false);
+      if (label) {
+        const msgText = String(text || '');
+        label.textContent =
+          syncProgState.cancelRequested && !syncProgState.finished && msgText && !msgText.includes('stopping after current book')
+            ? `${msgText} — stopping after current book...`
+            : msgText;
+      }
+      if (pctEl) pctEl.textContent = `${pct}%`;
+      if (opEl) {
+        opEl.textContent =
+          syncProgState.cancelRequested && !syncProgState.finished
+            ? 'Cancelling…'
+            : String(opLabel || inferSyncOpLabel(text, isDone, isErr, isCancelled));
+      }
+      if (syncProgState.finished) stopSyncCreep();
+      else scheduleSyncCreep();
     }
 
     function hideSyncProgress() {
+      stopSyncCreep();
+      stopSyncAutoHide();
+      syncProgState.finished = true;
       const box = container.querySelector('#sg-sync-progress');
-      const fill = container.querySelector('#sg-sync-fill');
-      const label = container.querySelector('#sg-sync-text');
       if (box) {
-        box.classList.remove('show');
+        box.classList.remove('show', 'active', 'done', 'err', 'cancelled');
         if (typeof box.setAttribute === 'function') {
           box.setAttribute('aria-valuenow', '0');
+          box.setAttribute('aria-hidden', 'true');
         }
       }
-      if (fill) fill.style.width = '0%';
-      if (label) label.textContent = '';
     }
 
     function setBusy(isBusy) {
@@ -3165,6 +3384,7 @@
       const wrap = container.querySelector('.sg-wrap');
       if (wrap) wrap.classList.toggle('sg-busy', isBusy);
       for (const btn of container.querySelectorAll('button')) {
+        if (btn.id === 'sg-sync-cancel') continue;
         if (isBusy) {
           if (!btn.disabled) {
             btn.dataset.sgWasEnabled = '1';
@@ -3935,7 +4155,12 @@
           setSyncProgress(100, summary);
           setBanner(summary, res.posted > 0 ? 'ok' : 'muted');
         } catch (err) {
-          hideSyncProgress();
+          setSyncProgress(
+            Math.max(15, syncProgState.real || 15),
+            String(err && err.message ? err.message : err),
+            'err',
+            'Failed'
+          );
           throw err;
         }
       });
@@ -4144,6 +4369,7 @@
       for (const book of outboxBooks.values()) {
         const match = findMappingForBook(mapData, book);
         const mapping = match ? match.entry : null;
+        if (!mapping && isBookIgnored(mapData, book)) continue;
         seenKeys.add(book.sdPath);
         rows.push({
           key: book.sdPath,
@@ -4341,23 +4567,41 @@
 
     async function verifySession() {
       return runExclusive('Checking StoryGraph session via /api/fetch...', async () => {
-        const html = await fetchStoryGraphHtml(BASE_URL + '/');
-        const parsed = parseStoryGraphHomepage(html);
-        if (!parsed.csrf) {
-          throw new Error('Logged in check did not find a Rails CSRF token.');
+        setSyncProgress(25, 'Connecting to StoryGraph...', 'active', 'Connecting');
+        try {
+          const html = await fetchStoryGraphHtml(BASE_URL + '/');
+          const parsed = parseStoryGraphHomepage(html);
+          if (!parsed.csrf) {
+            throw new Error('Logged in check did not find a Rails CSRF token.');
+          }
+          sessionVerified = true;
+          currentReads = parsed.currentReads || [];
+          updateCookieBadge();
+          renderBooks();
+          setSyncProgress(
+            100,
+            `100% — Connected (${currentReads.length} Current Read(s))`,
+            'done',
+            'Connected'
+          );
+          setBanner(
+            `Session verified. Found ${currentReads.length} Current Read(s) for quick linking.`,
+            'ok'
+          );
+        } catch (err) {
+          setSyncProgress(
+            Math.max(25, syncProgState.real || 25),
+            String(err && err.message ? err.message : err),
+            'err',
+            'Connection failed'
+          );
+          throw err;
         }
-        sessionVerified = true;
-        currentReads = parsed.currentReads || [];
-        updateCookieBadge();
-        renderBooks();
-        setBanner(
-          `Session verified. Found ${currentReads.length} Current Read(s) for quick linking.`,
-          'ok'
-        );
       });
     }
 
     async function linkBook(row, selection) {
+      setSyncProgress(35, `Linking "${row.title}" to StoryGraph...`, 'active', 'Linking');
       mapData.books[row.sdPath] = {
         bookId: selection.bookId,
         title: selection.title || row.title,
@@ -4371,11 +4615,28 @@
         lastSyncedPercent: selection.percent ?? null,
         lastSyncedAt: null
       };
-      await saveMapData();
+      unignoreBookInMap(mapData, row);
+      try {
+        await saveMapData();
+      } catch (err) {
+        setSyncProgress(35, String(err && err.message ? err.message : err), 'err', 'Link failed');
+        throw err;
+      }
       stagedBooks.delete(row.sdPath);
+      delete searchQueryByKey[row.key];
+      delete includeAudioByKey[row.key];
+      delete searchResultsByKey[row.key];
       activeLinkKey = null;
-      renderBooks();
+      if ((selection.status || 'currently-reading') === 'read') {
+        sectionOpenState.read = true;
+      } else {
+        sectionOpenState.reading = true;
+      }
+      flashKey = row.key;
+      renderBooks({ scrollToKey: row.key, scrollBlock: 'center', forceScroll: true });
       renderSdBrowser();
+      renderIgnoredBooks();
+      setSyncProgress(100, `100% — Linked "${row.title}" to StoryGraph`, 'done', 'Linked');
       setBanner(`Linked "${row.title}" to StoryGraph (${selection.bookId}).`, 'ok');
     }
 
@@ -4759,7 +5020,12 @@
             setBanner(res.summary, 'muted');
           }
         } catch (err) {
-          hideSyncProgress();
+          setSyncProgress(
+            Math.max(15, syncProgState.real || 15),
+            String(err && err.message ? err.message : err),
+            'err',
+            'Failed'
+          );
           throw err;
         }
       });
@@ -4774,98 +5040,127 @@
 
       const total = pending.length;
       await runExclusive(`Starting Sync All (${total} book(s))...`, async () => {
-        let synced = 0;
-        let skipped = 0;
-        let failed = 0;
-        let lastError = '';
-        let batchOverwriteDecision = overwriteLowerInBatch ? 'overwrite' : null;
+        beginBatchCancelScope();
+        try {
+          let synced = 0;
+          let skipped = 0;
+          let failed = 0;
+          let cancelled = false;
+          let lastError = '';
+          let batchOverwriteDecision = overwriteLowerInBatch ? 'overwrite' : null;
 
-        const confirmOverwrite = async (detail) => {
-          if (batchOverwriteDecision === 'overwrite') return true;
-          if (batchOverwriteDecision === 'skip') return false;
-          const ok = await confirmAction(
-            `${detail}. Click OK to overwrite this and any other lower/0% books in this Sync All batch, or Cancel to skip all lower/0% books.`
-          );
-          batchOverwriteDecision = ok ? 'overwrite' : 'skip';
-          return ok;
-        };
-
-        setSyncProgress(0, `Starting Sync All (0/${total})...`);
-
-        for (let i = 0; i < total; i++) {
-          const row = pending[i];
-          if (i > 0) {
-            await new Promise((r) => setTimeout(r, 400));
-          }
-          setBanner(`Syncing ${i + 1}/${total}: "${row.title}"...`, 'muted');
-          try {
-            const res = await syncBookCore(row, {
-              batchMode: true,
-              confirmOverwrite,
-              onStage(stage) {
-                if (stage === 'fetching') {
-                  const pct = Math.round(((i + 0.15) / total) * 100);
-                  setSyncProgress(pct, `Syncing ${i + 1} of ${total} (${pct}%) — "${row.title}" (loading page...)`);
-                } else if (stage === 'posting') {
-                  const pct = Math.round(((i + 0.65) / total) * 100);
-                  setSyncProgress(pct, `Syncing ${i + 1} of ${total} (${pct}%) — "${row.title}" (saving ${row.devicePercent}%...)`);
-                } else if (stage === 'marking-read') {
-                  const pct = Math.round(((i + 0.82) / total) * 100);
-                  setSyncProgress(pct, `Syncing ${i + 1} of ${total} (${pct}%) — "${row.title}" (marking Read...)`);
-                } else if (stage === 'syncing-dates') {
-                  const pct = Math.round(((i + 0.92) / total) * 100);
-                  setSyncProgress(pct, `Syncing ${i + 1} of ${total} (${pct}%) — "${row.title}" (syncing dates...)`);
-                }
-              }
-            });
-            if (res.outcome === 'synced') synced++;
-            else skipped++;
-            const donePct = Math.round(((i + 1) / total) * 100);
-            setSyncProgress(
-              donePct,
-              `${res.outcome === 'synced' ? 'Synced' : 'Skipped'} ${i + 1} of ${total} (${donePct}%) — "${row.title}"`
+          const confirmOverwrite = async (detail) => {
+            if (batchOverwriteDecision === 'overwrite') return true;
+            if (batchOverwriteDecision === 'skip') return false;
+            const ok = await confirmAction(
+              `${detail}. Click OK to overwrite this and any other lower/0% books in this Sync All batch, or Cancel to skip all lower/0% books.`
             );
-          } catch (err) {
-            failed++;
-            lastError = String(err && err.message ? err.message : err);
-            const lower = lastError.toLowerCase();
-            if (lower.includes('expired') || lower.includes('cloudflare') || lower.includes('blocked')) {
+            batchOverwriteDecision = ok ? 'overwrite' : 'skip';
+            return ok;
+          };
+
+          setSyncProgress(0, `Starting Sync All (0/${total})...`);
+
+          for (let i = 0; i < total; i++) {
+            if (syncProgState.cancelRequested) {
+              cancelled = true;
               break;
             }
+            const row = pending[i];
+            if (i > 0) {
+              await new Promise((r) => setTimeout(r, 400));
+              if (syncProgState.cancelRequested) {
+                cancelled = true;
+                break;
+              }
+            }
+            setBanner(`Syncing ${i + 1}/${total}: "${row.title}"...`, 'muted');
+            try {
+              const res = await syncBookCore(row, {
+                batchMode: true,
+                confirmOverwrite,
+                onStage(stage) {
+                  if (stage === 'fetching') {
+                    const pct = Math.round(((i + 0.15) / total) * 100);
+                    setSyncProgress(pct, `Syncing ${i + 1} of ${total} (${pct}%) — "${row.title}" (loading page...)`);
+                  } else if (stage === 'posting') {
+                    const pct = Math.round(((i + 0.65) / total) * 100);
+                    setSyncProgress(pct, `Syncing ${i + 1} of ${total} (${pct}%) — "${row.title}" (saving ${row.devicePercent}%...)`);
+                  } else if (stage === 'marking-read') {
+                    const pct = Math.round(((i + 0.82) / total) * 100);
+                    setSyncProgress(pct, `Syncing ${i + 1} of ${total} (${pct}%) — "${row.title}" (marking Read...)`);
+                  } else if (stage === 'syncing-dates') {
+                    const pct = Math.round(((i + 0.92) / total) * 100);
+                    setSyncProgress(pct, `Syncing ${i + 1} of ${total} (${pct}%) — "${row.title}" (syncing dates...)`);
+                  }
+                }
+              });
+              if (res.outcome === 'synced') synced++;
+              else skipped++;
+              const donePct = Math.round(((i + 1) / total) * 100);
+              setSyncProgress(
+                donePct,
+                `${res.outcome === 'synced' ? 'Synced' : 'Skipped'} ${i + 1} of ${total} (${donePct}%) — "${row.title}"`
+              );
+            } catch (err) {
+              failed++;
+              lastError = String(err && err.message ? err.message : err);
+              const lower = lastError.toLowerCase();
+              if (lower.includes('expired') || lower.includes('cloudflare') || lower.includes('blocked')) {
+                break;
+              }
+            }
           }
-        }
 
-        let compactedNote = '';
-        if (autoCompact && synced > 0 && failed === 0) {
-          setSyncProgress(98, 'Saving reading history & compacting events.jsonl...');
-          const preHist = mergeEventsIntoHistory(historyData, outboxRaw);
-          if (preHist.changed) {
-            historyData = preHist.history;
-            await saveHistoryData();
+          let compactedNote = '';
+          if (!cancelled && autoCompact && synced > 0 && failed === 0) {
+            setSyncProgress(98, 'Saving reading history & compacting events.jsonl...');
+            const preHist = mergeEventsIntoHistory(historyData, outboxRaw);
+            if (preHist.changed) {
+              historyData = preHist.history;
+              await saveHistoryData();
+            }
+            await writePluginText(EVENTS_FILE, compactEventsJsonl(outboxRaw, historyData));
+            await loadLocalState();
+            renderAll();
+            compactedNote = `, compacted outbox (${outboxBytes}/${OUTBOX_LIMIT_BYTES} B)`;
           }
-          await writePluginText(EVENTS_FILE, compactEventsJsonl(outboxRaw, historyData));
-          await loadLocalState();
-          renderAll();
-          compactedNote = `, compacted outbox (${outboxBytes}/${OUTBOX_LIMIT_BYTES} B)`;
-        }
 
-        if (failed > 0) {
-          const failPct = Math.min(99, Math.round(((synced + skipped) / total) * 100));
-          setSyncProgress(
-            failPct,
-            `Sync All stopped: ${synced} synced, ${skipped} skipped, ${failed} failed`
-          );
-          setBanner(
-            `Sync All finished: ${synced} synced, ${skipped} skipped, ${failed} failed (${lastError}).`,
-            'err'
-          );
-        } else if (synced === 0) {
-          setSyncProgress(100, `100% — Sync All finished: ${skipped} skipped`);
-          setBanner(`Sync All finished: ${skipped} skipped.`, 'muted');
-        } else {
-          const skipPart = skipped ? `, ${skipped} skipped` : '';
-          setSyncProgress(100, `100% — Sync All complete: ${synced} synced${skipPart}${compactedNote}`);
-          setBanner(`Sync All complete: ${synced} synced${skipPart}${compactedNote}.`, 'ok');
+          if (cancelled) {
+            const donePct = Math.round(((synced + skipped) / total) * 100);
+            const skipPart = skipped ? `, ${skipped} skipped` : '';
+            const failPart = failed ? `, ${failed} failed` : '';
+            setSyncProgress(
+              donePct,
+              `Cancelled after ${synced + skipped}/${total}: ${synced} synced${skipPart}${failPart}`,
+              'cancelled',
+              'Cancelled'
+            );
+            setBanner(
+              `Sync All cancelled (${synced} synced${skipPart}${failPart}).`,
+              failed > 0 ? 'err' : 'muted'
+            );
+          } else if (failed > 0) {
+            const failPct = Math.min(99, Math.round(((synced + skipped) / total) * 100));
+            setSyncProgress(
+              failPct,
+              `Sync All stopped: ${synced} synced, ${skipped} skipped, ${failed} failed`,
+              'err'
+            );
+            setBanner(
+              `Sync All finished: ${synced} synced, ${skipped} skipped, ${failed} failed (${lastError}).`,
+              'err'
+            );
+          } else if (synced === 0) {
+            setSyncProgress(100, `100% — Sync All finished: ${skipped} skipped`);
+            setBanner(`Sync All finished: ${skipped} skipped.`, 'muted');
+          } else {
+            const skipPart = skipped ? `, ${skipped} skipped` : '';
+            setSyncProgress(100, `100% — Sync All complete: ${synced} synced${skipPart}${compactedNote}`);
+            setBanner(`Sync All complete: ${synced} synced${skipPart}${compactedNote}.`, 'ok');
+          }
+        } finally {
+          endBatchCancelScope();
         }
       });
     }
@@ -4879,68 +5174,96 @@
 
       const total = candidates.length;
       await runExclusive(`Starting Sync Dates (${total} book(s))...`, async () => {
-        let updated = 0;
-        let matched = 0;
-        let failed = 0;
-        let lastError = '';
+        beginBatchCancelScope();
+        try {
+          let updated = 0;
+          let matched = 0;
+          let failed = 0;
+          let cancelled = false;
+          let lastError = '';
 
-        setSyncProgress(0, `Syncing Dates (0/${total})...`);
+          setSyncProgress(0, `Syncing Dates (0/${total})...`);
 
-        for (let i = 0; i < total; i++) {
-          const row = candidates[i];
-          const mapping = row.mapping;
-          if (!mapping || !mapping.bookId) continue;
-          if (i > 0) {
-            await sleepMs(400);
-          }
-          setBanner(`Syncing dates ${i + 1}/${total}: "${row.title}"...`, 'muted');
-          try {
-            const loadingPct = Math.round(((i + 0.2) / total) * 100);
-            setSyncProgress(loadingPct, `Syncing dates ${i + 1} of ${total} (${loadingPct}%) — "${row.title}" (loading page...)`);
-            const bookUrl = `${BASE_URL}/books/${encodeURIComponent(mapping.bookId)}`;
-            const html = await fetchStoryGraphHtml(bookUrl);
-            let pageInfo = parseStoryGraphBookPage(html, mapping.bookId);
-            if (!pageInfo.csrf) {
-              throw new Error('Could not find fresh CSRF token on book page.');
-            }
-            const postingPct = Math.round(((i + 0.7) / total) * 100);
-            setSyncProgress(postingPct, `Syncing dates ${i + 1} of ${total} (${postingPct}%) — "${row.title}" (updating dates...)`);
-            const dateRes = await syncBookDates(row, pageInfo, bookUrl);
-            if (dateRes.updated) updated++;
-            else matched++;
-            if (applyDateSyncToMapping(mapping, dateRes)) {
-              await saveMapData();
-            }
-            const donePct = Math.round(((i + 1) / total) * 100);
-            setSyncProgress(
-              donePct,
-              `${dateRes.updated ? 'Updated dates' : 'Matched'} ${i + 1} of ${total} (${donePct}%) — "${row.title}"`
-            );
-          } catch (err) {
-            failed++;
-            lastError = String(err && err.message ? err.message : err);
-            const lower = lastError.toLowerCase();
-            if (lower.includes('expired') || lower.includes('cloudflare') || lower.includes('blocked')) {
+          for (let i = 0; i < total; i++) {
+            if (syncProgState.cancelRequested) {
+              cancelled = true;
               break;
             }
+            const row = candidates[i];
+            const mapping = row.mapping;
+            if (!mapping || !mapping.bookId) continue;
+            if (i > 0) {
+              await sleepMs(400);
+              if (syncProgState.cancelRequested) {
+                cancelled = true;
+                break;
+              }
+            }
+            setBanner(`Syncing dates ${i + 1}/${total}: "${row.title}"...`, 'muted');
+            try {
+              const loadingPct = Math.round(((i + 0.2) / total) * 100);
+              setSyncProgress(loadingPct, `Syncing dates ${i + 1} of ${total} (${loadingPct}%) — "${row.title}" (loading page...)`);
+              const bookUrl = `${BASE_URL}/books/${encodeURIComponent(mapping.bookId)}`;
+              const html = await fetchStoryGraphHtml(bookUrl);
+              let pageInfo = parseStoryGraphBookPage(html, mapping.bookId);
+              if (!pageInfo.csrf) {
+                throw new Error('Could not find fresh CSRF token on book page.');
+              }
+              const postingPct = Math.round(((i + 0.7) / total) * 100);
+              setSyncProgress(postingPct, `Syncing dates ${i + 1} of ${total} (${postingPct}%) — "${row.title}" (updating dates...)`);
+              const dateRes = await syncBookDates(row, pageInfo, bookUrl);
+              if (dateRes.updated) updated++;
+              else matched++;
+              if (applyDateSyncToMapping(mapping, dateRes)) {
+                await saveMapData();
+              }
+              const donePct = Math.round(((i + 1) / total) * 100);
+              setSyncProgress(
+                donePct,
+                `${dateRes.updated ? 'Updated dates' : 'Matched'} ${i + 1} of ${total} (${donePct}%) — "${row.title}"`
+              );
+            } catch (err) {
+              failed++;
+              lastError = String(err && err.message ? err.message : err);
+              const lower = lastError.toLowerCase();
+              if (lower.includes('expired') || lower.includes('cloudflare') || lower.includes('blocked')) {
+                break;
+              }
+            }
           }
-        }
 
-        renderBooks();
+          renderBooks();
 
-        if (failed > 0) {
-          const failPct = Math.min(99, Math.round(((updated + matched) / total) * 100));
-          setSyncProgress(
-            failPct,
-            `Date sync stopped: ${updated} updated, ${matched} already matched, ${failed} failed`
-          );
-          setBanner(
-            `Date sync finished: ${updated} updated, ${matched} already matched, ${failed} failed (${lastError}).`,
-            'err'
-          );
-        } else {
-          setSyncProgress(100, `100% — Date sync complete: ${updated} updated, ${matched} already matched`);
-          setBanner(`Date sync complete: ${updated} updated, ${matched} already matched.`, updated > 0 ? 'ok' : 'muted');
+          if (cancelled) {
+            const donePct = Math.round(((updated + matched) / total) * 100);
+            const failPart = failed ? `, ${failed} failed` : '';
+            setSyncProgress(
+              donePct,
+              `Cancelled after ${updated + matched}/${total}: ${updated} updated, ${matched} already matched${failPart}`,
+              'cancelled',
+              'Cancelled'
+            );
+            setBanner(
+              `Date sync cancelled (${updated} updated, ${matched} already matched${failPart}).`,
+              failed > 0 ? 'err' : 'muted'
+            );
+          } else if (failed > 0) {
+            const failPct = Math.min(99, Math.round(((updated + matched) / total) * 100));
+            setSyncProgress(
+              failPct,
+              `Date sync stopped: ${updated} updated, ${matched} already matched, ${failed} failed`,
+              'err'
+            );
+            setBanner(
+              `Date sync finished: ${updated} updated, ${matched} already matched, ${failed} failed (${lastError}).`,
+              'err'
+            );
+          } else {
+            setSyncProgress(100, `100% — Date sync complete: ${updated} updated, ${matched} already matched`);
+            setBanner(`Date sync complete: ${updated} updated, ${matched} already matched.`, updated > 0 ? 'ok' : 'muted');
+          }
+        } finally {
+          endBatchCancelScope();
         }
       });
     }
@@ -4958,96 +5281,125 @@
           : CLEAN_JOURNALS_PACING_MS;
       const total = linkedRows.length;
       await runExclusive(`Scanning & cleaning journals (${total} book(s))...`, async () => {
-        let skipped = 0;
-        let verifiedClean = 0;
-        let booksModified = 0;
-        let totalDeleted = 0;
-        let totalUpdated = 0;
-        let failed = 0;
-        let lastError = '';
-        let fetchedCount = 0;
-        let mapDirty = false;
+        beginBatchCancelScope();
+        try {
+          let skipped = 0;
+          let verifiedClean = 0;
+          let booksModified = 0;
+          let totalDeleted = 0;
+          let totalUpdated = 0;
+          let failed = 0;
+          let cancelled = false;
+          let lastError = '';
+          let fetchedCount = 0;
+          let mapDirty = false;
 
-        setSyncProgress(0, `Cleaning Journals (0/${total})...`);
+          setSyncProgress(0, `Cleaning Journals (0/${total})...`);
 
-        for (let i = 0; i < total; i++) {
-          const row = linkedRows[i];
-          if (shouldSkipJournalCleanup(row, historyData)) {
-            skipped++;
-            const donePct = Math.round(((i + 1) / total) * 100);
-            setSyncProgress(donePct, `Skipped (cached clean) ${i + 1} of ${total} (${donePct}%) — "${row.title}"`);
-            continue;
-          }
-          if (fetchedCount > 0 && pacingMs > 0) {
-            await sleepMs(pacingMs);
-          }
-          fetchedCount++;
-          const pct = Math.round(((i + 0.3) / total) * 100);
-          setSyncProgress(pct, `Scanning journal ${i + 1} of ${total} (${pct}%) — "${row.title}"...`);
-          setBanner(`Scanning journal ${i + 1}/${total}: "${row.title}"...`, 'muted');
-          try {
-            const res = await cleanBookJournalCore(row);
-            if (res.deleted > 0 || res.updated > 0) {
-              booksModified++;
-              totalDeleted += res.deleted;
-              totalUpdated += res.updated;
-            } else {
-              verifiedClean++;
-            }
-            stampBookCleanupVerified(row.mapping, historyData, row);
-            mapDirty = true;
-            const donePct = Math.round(((i + 1) / total) * 100);
-            const actLabel =
-              res.deleted > 0 || res.updated > 0
-                ? `Cleaned (${res.deleted} deleted${res.updated ? ', ' + res.updated + ' repaired' : ''})`
-                : 'Verified clean';
-            setSyncProgress(donePct, `${actLabel} ${i + 1} of ${total} (${donePct}%) — "${row.title}"`);
-          } catch (err) {
-            failed++;
-            lastError = String(err && err.message ? err.message : err);
-            const lower = lastError.toLowerCase();
-            if (
-              lower.includes('expired') ||
-              lower.includes('cloudflare') ||
-              lower.includes('blocked') ||
-              lower.includes('http 401') ||
-              lower.includes('http 403')
-            ) {
+          for (let i = 0; i < total; i++) {
+            if (syncProgState.cancelRequested) {
+              cancelled = true;
               break;
             }
+            const row = linkedRows[i];
+            if (shouldSkipJournalCleanup(row, historyData)) {
+              skipped++;
+              const donePct = Math.round(((i + 1) / total) * 100);
+              setSyncProgress(donePct, `Skipped (cached clean) ${i + 1} of ${total} (${donePct}%) — "${row.title}"`);
+              continue;
+            }
+            if (fetchedCount > 0 && pacingMs > 0) {
+              await sleepMs(pacingMs);
+              if (syncProgState.cancelRequested) {
+                cancelled = true;
+                break;
+              }
+            }
+            fetchedCount++;
+            const pct = Math.round(((i + 0.3) / total) * 100);
+            setSyncProgress(pct, `Scanning journal ${i + 1} of ${total} (${pct}%) — "${row.title}"...`);
+            setBanner(`Scanning journal ${i + 1}/${total}: "${row.title}"...`, 'muted');
+            try {
+              const res = await cleanBookJournalCore(row);
+              if (res.deleted > 0 || res.updated > 0) {
+                booksModified++;
+                totalDeleted += res.deleted;
+                totalUpdated += res.updated;
+              } else {
+                verifiedClean++;
+              }
+              stampBookCleanupVerified(row.mapping, historyData, row);
+              mapDirty = true;
+              const donePct = Math.round(((i + 1) / total) * 100);
+              const actLabel =
+                res.deleted > 0 || res.updated > 0
+                  ? `Cleaned (${res.deleted} deleted${res.updated ? ', ' + res.updated + ' repaired' : ''})`
+                  : 'Verified clean';
+              setSyncProgress(donePct, `${actLabel} ${i + 1} of ${total} (${donePct}%) — "${row.title}"`);
+            } catch (err) {
+              failed++;
+              lastError = String(err && err.message ? err.message : err);
+              const lower = lastError.toLowerCase();
+              if (
+                lower.includes('expired') ||
+                lower.includes('cloudflare') ||
+                lower.includes('blocked') ||
+                lower.includes('http 401') ||
+                lower.includes('http 403')
+              ) {
+                break;
+              }
+            }
           }
-        }
 
-        if (mapDirty) {
-          try {
-            await saveMapData();
-          } catch (_) {}
-        }
+          if (mapDirty) {
+            try {
+              await saveMapData();
+            } catch (_) {}
+          }
 
-        const skipPart = skipped > 0 ? `, ${skipped} skipped` : '';
-        if (failed > 0) {
-          const failPct = Math.min(99, Math.round(((skipped + verifiedClean + booksModified) / total) * 100));
-          setSyncProgress(
-            failPct,
-            `Journal cleanup finished: ${booksModified} modified, ${verifiedClean} verified clean${skipPart}, ${failed} failed`
-          );
-          setBanner(
-            `Journal cleanup finished: ${totalDeleted} deleted, ${totalUpdated} repaired across ${booksModified} modified, ${verifiedClean} verified clean${skipPart}, ${failed} failed (${lastError}).`,
-            'err'
-          );
-        } else if (totalDeleted === 0 && totalUpdated === 0) {
-          const summary =
-            skipped > 0
-              ? `All ${total} linked book journal(s) are clean (${verifiedClean} verified clean, ${skipped} skipped).`
-              : `All ${total} linked book journal(s) are already clean (${verifiedClean} verified clean).`;
-          setSyncProgress(100, `100% — ${summary}`);
-          setBanner(summary, 'muted');
-        } else {
-          const repairNote = totalUpdated > 0 ? `, ${totalUpdated} Finished page credit(s) repaired` : '';
-          const cleanPart = verifiedClean > 0 ? `, ${verifiedClean} verified clean` : '';
-          const msg = `Journal cleanup complete: ${totalDeleted} redundant/0% entry(s) deleted${repairNote} across ${booksModified} book(s)${cleanPart}${skipPart}.`;
-          setSyncProgress(100, `100% — ${msg}`);
-          setBanner(msg, 'ok');
+          const skipPart = skipped > 0 ? `, ${skipped} skipped` : '';
+          if (cancelled) {
+            const processed = skipped + verifiedClean + booksModified;
+            const donePct = Math.round((processed / total) * 100);
+            const failPart = failed ? `, ${failed} failed` : '';
+            setSyncProgress(
+              donePct,
+              `Cancelled after ${processed}/${total}: ${booksModified} modified, ${verifiedClean} verified clean${skipPart}${failPart}`,
+              'cancelled',
+              'Cancelled'
+            );
+            setBanner(
+              `Journal cleanup cancelled (${booksModified} modified, ${verifiedClean} verified clean${skipPart}${failPart}).`,
+              failed > 0 ? 'err' : 'muted'
+            );
+          } else if (failed > 0) {
+            const failPct = Math.min(99, Math.round(((skipped + verifiedClean + booksModified) / total) * 100));
+            setSyncProgress(
+              failPct,
+              `Journal cleanup finished: ${booksModified} modified, ${verifiedClean} verified clean${skipPart}, ${failed} failed`,
+              'err'
+            );
+            setBanner(
+              `Journal cleanup finished: ${totalDeleted} deleted, ${totalUpdated} repaired across ${booksModified} modified, ${verifiedClean} verified clean${skipPart}, ${failed} failed (${lastError}).`,
+              'err'
+            );
+          } else if (totalDeleted === 0 && totalUpdated === 0) {
+            const summary =
+              skipped > 0
+                ? `All ${total} linked book journal(s) are clean (${verifiedClean} verified clean, ${skipped} skipped).`
+                : `All ${total} linked book journal(s) are already clean (${verifiedClean} verified clean).`;
+            setSyncProgress(100, `100% — ${summary}`);
+            setBanner(summary, 'muted');
+          } else {
+            const repairNote = totalUpdated > 0 ? `, ${totalUpdated} Finished page credit(s) repaired` : '';
+            const cleanPart = verifiedClean > 0 ? `, ${verifiedClean} verified clean` : '';
+            const msg = `Journal cleanup complete: ${totalDeleted} redundant/0% entry(s) deleted${repairNote} across ${booksModified} book(s)${cleanPart}${skipPart}.`;
+            setSyncProgress(100, `100% — ${msg}`);
+            setBanner(msg, 'ok');
+          }
+        } finally {
+          endBatchCancelScope();
         }
       });
     }
@@ -5068,7 +5420,12 @@
           setSyncProgress(100, msg);
           setBanner(msg, res.deleted > 0 || res.updated > 0 ? 'ok' : 'muted');
         } catch (err) {
-          hideSyncProgress();
+          setSyncProgress(
+            Math.max(15, syncProgState.real || 15),
+            String(err && err.message ? err.message : err),
+            'err',
+            'Failed'
+          );
           throw err;
         }
       });
@@ -5142,7 +5499,12 @@
           setSyncProgress(100, `Marked "${row.title}" as Read on StoryGraph${dateNote}.`);
           setBanner(`Marked "${row.title}" as Read on StoryGraph${dateNote}.`, 'ok');
         } catch (err) {
-          hideSyncProgress();
+          setSyncProgress(
+            Math.max(15, syncProgState.real || 15),
+            String(err && err.message ? err.message : err),
+            'err',
+            'Failed'
+          );
           throw err;
         }
       });
@@ -5384,9 +5746,11 @@
       const toolsBadge = container.querySelector('#sg-tools-badge');
       if (toolsBadge) {
         const nearCap = outboxBytes >= OUTBOX_WARN_BYTES;
+        const ignoredCount = Object.keys((mapData && mapData.ignored) || {}).length;
+        const ignNote = ignoredCount > 0 ? ` · ${ignoredCount} ignored` : '';
         toolsBadge.textContent = nearCap
           ? `Outbox near 4 KB (${outboxBytes}/${OUTBOX_LIMIT_BYTES} B)!`
-          : `Clean Journals · Outbox ${outboxBytes} B`;
+          : `Clean Journals · Outbox ${outboxBytes} B${ignNote}`;
         toolsBadge.className = nearCap ? 'sg-err' : 'sg-muted';
       }
       const tabsEl = container.querySelector('#sg-filter-tabs');
@@ -5500,12 +5864,15 @@
           `<button type="button" class="sg-btn sg-btn-sm sg-btn-primary" data-act="toggle-link" data-key="${escapeHtml(row.key)}">${isOpen ? 'Close Linker' : 'Link Book'}</button>` +
           (row.staged
             ? `<button type="button" class="sg-btn sg-btn-sm sg-btn-ghost" data-act="remove-staged" data-key="${escapeHtml(row.key)}">Remove</button>`
-            : '');
+            : `<button type="button" class="sg-btn sg-btn-sm sg-btn-ghost" data-act="ignore-book" data-key="${escapeHtml(row.key)}" title="Hide this book from the list (can be restored under Tools &amp; Preferences)">Ignore</button>`);
       }
 
       let linkerHtml = '';
       if (!m && activeLinkKey === row.key) {
         const defaultQuery = [row.title, row.author].filter(Boolean).join(' ');
+        const queryValue = searchQueryByKey[row.key] != null ? searchQueryByKey[row.key] : defaultQuery;
+        const isSearching = searchingKey === row.key;
+        const hasSearched = Object.prototype.hasOwnProperty.call(searchResultsByKey, row.key);
         const results = searchResultsByKey[row.key] || [];
         const crHtml = currentReads.length
           ? '<div class="sg-subsec"><strong>Quick link from Current Reads:</strong><div class="sg-chip-list">' +
@@ -5518,8 +5885,13 @@
             '</div></div>'
           : '';
 
-        const resHtml = results.length
-          ? '<div class="sg-results">' +
+        let resHtml = '';
+        if (isSearching) {
+          resHtml =
+            '<div class="sg-searching sg-muted" role="status"><span class="sg-spinner" aria-hidden="true"></span>Searching StoryGraph…</div>';
+        } else if (results.length) {
+          resHtml =
+            `<div class="sg-results${resultsEnterKey === row.key ? ' sg-enter' : ''}">` +
             results
               .map(
                 (r) =>
@@ -5527,18 +5899,22 @@
                   `<button type="button" class="sg-btn sg-btn-sm sg-btn-primary" data-act="pick-res" data-key="${escapeHtml(row.key)}" data-bookid="${escapeHtml(r.bookId)}">Link</button></div>`
               )
               .join('') +
-            '</div>'
-          : '';
+            '</div>';
+        } else if (hasSearched) {
+          resHtml =
+            `<div class="sg-muted${resultsEnterKey === row.key ? ' sg-enter' : ''}">No matching editions found. Try a shorter title, or paste a StoryGraph book URL below.</div>`;
+        }
 
         linkerHtml =
-          `<div class="sg-linker">` +
+          `<div class="sg-linker${linkerEnterKey === row.key ? ' sg-enter' : ''}">` +
+            `<div class="sg-linker-head"><span>Link edition for <strong>${escapeHtml(row.title)}</strong></span></div>` +
             crHtml +
             `<div class="sg-subsec">` +
               `<div class="sg-row">` +
-                `<input type="text" class="sg-input" data-role="search-q" data-key="${escapeHtml(row.key)}" value="${escapeHtml(defaultQuery)}" placeholder="Search title / author..." />` +
-                `<button type="button" class="sg-btn sg-btn-primary" data-act="search" data-key="${escapeHtml(row.key)}">Search</button>` +
+                `<input type="text" class="sg-input" data-role="search-q" data-key="${escapeHtml(row.key)}" value="${escapeHtml(queryValue)}" placeholder="Search title / author..." />` +
+                `<button type="button" class="sg-btn sg-btn-primary" data-act="search" data-key="${escapeHtml(row.key)}">${isSearching ? 'Searching…' : 'Search'}</button>` +
               `</div>` +
-              `<label class="sg-muted"><input type="checkbox" data-role="include-audio" data-key="${escapeHtml(row.key)}" /> Include audiobooks</label>` +
+              `<label class="sg-muted"><input type="checkbox" data-role="include-audio" data-key="${escapeHtml(row.key)}"${includeAudioByKey[row.key] ? ' checked' : ''} /> Include audiobooks</label>` +
               resHtml +
             `</div>` +
             `<div class="sg-subsec sg-row">` +
@@ -5568,12 +5944,35 @@
         pctLabel = `<span class="sg-muted">Synced ${escapeHtml(syncedPct)}</span>`;
       }
 
+      let barHtml = '';
+      if (row.devicePercent !== null) {
+        const devPct = Math.max(0, Math.min(100, Number(row.devicePercent) || 0));
+        const hasSynced = Boolean(m) && m.lastSyncedPercent !== null && m.lastSyncedPercent !== undefined;
+        const syncedBarPct = hasSynced ? Math.max(0, Math.min(devPct, Number(m.lastSyncedPercent) || 0)) : 0;
+        const prevBar = renderedBarPctByKey[row.key];
+        const startDev = prevBar ? prevBar.device : devPct;
+        const startSynced = prevBar ? prevBar.synced : syncedBarPct;
+        renderedBarPctByKey[row.key] = { device: devPct, synced: syncedBarPct };
+        const ahead = Boolean(m) && syncedBarPct < devPct;
+        const isDoneBar = Boolean(m) && (m.status === 'read' || (devPct === 100 && syncedBarPct === 100));
+        const fillCls = ahead ? ' sg-progress-ahead' : isDoneBar ? ' sg-progress-done' : '';
+        const syncedCls = isDoneBar ? ' sg-progress-done' : '';
+        const barTip = !m
+          ? `On device: ${devPct}% (not linked)`
+          : ahead
+            ? `On device: ${devPct}% · On StoryGraph: ${hasSynced ? m.lastSyncedPercent + '%' : 'not synced yet'}`
+            : `On device: ${devPct}% · Synced to StoryGraph`;
+        barHtml =
+          `<div class="sg-progress" title="${escapeHtml(barTip)}" aria-hidden="true">` +
+            `<div class="sg-progress-fill${fillCls}" data-w="${devPct}" style="width:${startDev}%"></div>` +
+            (m ? `<div class="sg-progress-synced${syncedCls}" data-w="${syncedBarPct}" style="width:${startSynced}%"></div>` : '') +
+          `</div>`;
+      }
+
       const footHtml =
         row.devicePercent !== null || m
           ? `<div class="sg-book-foot">` +
-              (row.devicePercent !== null
-                ? `<div class="sg-progress" aria-hidden="true"><div class="sg-progress-fill" style="width:${row.devicePercent}%"></div></div>`
-                : '') +
+              barHtml +
               `<div class="sg-book-pct">${pctLabel}</div>` +
             `</div>`
           : '';
@@ -5735,7 +6134,7 @@
       }
 
       return (
-        `<div class="sg-book">` +
+        `<div class="sg-book${!m && activeLinkKey === row.key ? ' sg-linking' : ''}${flashKey === row.key ? ' sg-flash' : ''}" data-book-key="${escapeHtml(row.key)}">` +
           `<div class="sg-book-head">` +
             `<div class="sg-book-title-wrap">${titleHtml} ${pill}${datesPill ? ' ' + datesPill : ''}</div>` +
             `<div class="sg-book-actions">${actionsHtml}</div>` +
@@ -5748,15 +6147,105 @@
       );
     }
 
-    function renderBooks() {
+    function findBookCardEl(listEl, key) {
+      if (!listEl || !key) return null;
+      for (const el of listEl.querySelectorAll('.sg-book')) {
+        if (el.getAttribute('data-book-key') === key) return el;
+      }
+      return null;
+    }
+
+    function animateProgressBars(listEl) {
+      if (!listEl) return;
+      const bars = [];
+      for (const el of listEl.querySelectorAll('.sg-progress-fill, .sg-progress-synced')) {
+        const target = el.getAttribute('data-w');
+        if (target === null || target === undefined || target === '') continue;
+        const targetWidth = `${target}%`;
+        if (el.style && el.style.width !== targetWidth) {
+          bars.push({ el, targetWidth });
+        }
+      }
+      if (bars.length === 0) return;
+      const apply = () => {
+        for (const item of bars) {
+          if (item.el && item.el.style) item.el.style.width = item.targetWidth;
+        }
+      };
+      if (typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(() => requestAnimationFrame(apply));
+      } else {
+        apply();
+      }
+    }
+
+    function focusLinkerUi(key) {
+      const run = () => {
+        const listEl = container.querySelector('#sg-books-list');
+        const card = findBookCardEl(listEl, key);
+        if (!card) return;
+        if (typeof card.closest === 'function') {
+          const sec = card.closest('details.sg-section');
+          if (sec) sec.open = true;
+        }
+        const linker = card.querySelector('.sg-linker');
+        const qInp = Array.from(card.querySelectorAll('input')).find(
+          (el) => el.getAttribute('data-role') === 'search-q'
+        );
+        if (qInp && typeof qInp.focus === 'function') {
+          try {
+            qInp.focus({ preventScroll: true });
+          } catch (_) {
+            qInp.focus();
+          }
+        }
+        let scrollTarget = card;
+        let scrollBlock = 'center';
+        if (
+          linker &&
+          typeof card.getBoundingClientRect === 'function' &&
+          typeof window !== 'undefined' &&
+          typeof window.innerHeight === 'number'
+        ) {
+          const rect = card.getBoundingClientRect();
+          if (rect.height > window.innerHeight * 0.85) {
+            scrollTarget = linker;
+            scrollBlock = 'start';
+          }
+        }
+        if (scrollTarget && typeof scrollTarget.scrollIntoView === 'function') {
+          scrollTarget.scrollIntoView({ behavior: 'smooth', block: scrollBlock });
+        } else if (linker && typeof linker.scrollIntoView === 'function') {
+          linker.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      };
+      if (typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(run);
+      } else {
+        run();
+      }
+    }
+
+    function renderBooks(opts = {}) {
       renderHeaderStats();
       const listEl = container.querySelector('#sg-books-list');
       if (!listEl) return;
+      const anchorKey = opts && opts.anchorKey ? opts.anchorKey : null;
+      let prevTop = null;
+      if (anchorKey) {
+        const prevEl = findBookCardEl(listEl, anchorKey);
+        if (prevEl && typeof prevEl.getBoundingClientRect === 'function') {
+          prevTop = prevEl.getBoundingClientRect().top;
+        }
+      }
       const allRows = buildBookRows();
 
       if (allRows.length === 0) {
         listEl.innerHTML =
           '<p class="sg-muted">No reading events recorded yet. Open a book on your e-reader, read a few pages, and exit back to Home.</p>';
+        linkerEnterKey = null;
+        resultsEnterKey = null;
+        flashKey = null;
         return;
       }
 
@@ -5772,6 +6261,9 @@
           ? `No books match "${escapeHtml(qTrim)}".`
           : 'No books in this category.';
         listEl.innerHTML = `<p class="sg-muted">${msg}</p>`;
+        linkerEnterKey = null;
+        resultsEnterKey = null;
+        flashKey = null;
         return;
       }
 
@@ -5779,9 +6271,7 @@
         const readingRows = filtered.filter((r) => classifyBookRow(r) === 'reading');
         const unlinkedRows = filtered.filter((r) => classifyBookRow(r) === 'unlinked');
         const readRows = filtered.filter((r) => classifyBookRow(r) === 'read');
-        const unlinkedPriority = unlinkedRows.some(
-          (r) => r.staged || (activeLinkKey && activeLinkKey === r.key)
-        );
+        const unlinkedPriority = unlinkedRows.some((r) => r.staged);
         const sections = unlinkedPriority
           ? [
               { key: 'unlinked', label: 'Unlinked & From SD', items: unlinkedRows, open: sectionOpenState.unlinked !== false },
@@ -5839,6 +6329,48 @@
             btn.dataset.sgWasEnabled = '1';
             btn.disabled = true;
           }
+        }
+      }
+
+      const scrollToKey = opts && opts.scrollToKey ? opts.scrollToKey : null;
+      const scrollBlock = (opts && opts.scrollBlock) || 'nearest';
+      const forceScroll = Boolean(opts && opts.forceScroll);
+      linkerEnterKey = null;
+      resultsEnterKey = null;
+      flashKey = null;
+      animateProgressBars(listEl);
+
+      if (anchorKey && prevTop !== null && typeof window !== 'undefined' && typeof window.scrollBy === 'function') {
+        const nextEl = findBookCardEl(listEl, anchorKey);
+        if (nextEl && typeof nextEl.getBoundingClientRect === 'function') {
+          const nextTop = nextEl.getBoundingClientRect().top;
+          if (Math.abs(nextTop - prevTop) > 1) {
+            window.scrollBy(0, nextTop - prevTop);
+          }
+        }
+      } else if (scrollToKey) {
+        const runScroll = () => {
+          const curList = container.querySelector('#sg-books-list');
+          const targetEl = findBookCardEl(curList, scrollToKey);
+          if (targetEl && typeof targetEl.scrollIntoView === 'function') {
+            let shouldScroll = forceScroll;
+            if (!shouldScroll) {
+              if (typeof targetEl.getBoundingClientRect === 'function' && typeof window !== 'undefined' && typeof window.innerHeight === 'number') {
+                const rect = targetEl.getBoundingClientRect();
+                shouldScroll = rect.top < 0 || rect.bottom > window.innerHeight;
+              } else {
+                shouldScroll = true;
+              }
+            }
+            if (shouldScroll) {
+              targetEl.scrollIntoView({ behavior: 'smooth', block: scrollBlock });
+            }
+          }
+        };
+        if (typeof requestAnimationFrame === 'function') {
+          requestAnimationFrame(runScroll);
+        } else {
+          runScroll();
         }
       }
     }
@@ -5931,10 +6463,19 @@
                 normAuthor: meta.normAuthor
               })
             );
+            const ignored =
+              !mapped &&
+              isBookIgnored(mapData, {
+                sdPath: fullPath,
+                normFilename: meta.normFilename,
+                documentHash: ''
+              });
             const inList = outboxBooks.has(fullPath) || stagedBooks.has(fullPath);
             let ctrlHtml = '';
             if (mapped) {
               ctrlHtml = `<span class="sg-pill sg-pill-done">Linked</span>`;
+            } else if (ignored) {
+              ctrlHtml = `<div class="sg-row"><span class="sg-pill sg-pill-muted">Ignored</span><button type="button" class="sg-btn sg-btn-sm" data-sd-act="unignore-book" data-path="${escapeHtml(fullPath)}">Restore</button></div>`;
             } else if (inList) {
               ctrlHtml = `<button type="button" class="sg-btn" data-sd-act="add-book" data-path="${escapeHtml(fullPath)}">Open Linker</button>`;
             } else {
@@ -5966,15 +6507,60 @@
       }
     }
 
+    function renderIgnoredBooks() {
+      const ignored = mapData && mapData.ignored && typeof mapData.ignored === 'object' ? mapData.ignored : {};
+      const entries = Object.entries(ignored)
+        .filter(([, entry]) => entry && typeof entry === 'object')
+        .sort((a, b) => String((a[1] && a[1].title) || a[0]).localeCompare(String((b[1] && b[1].title) || b[0])));
+      const countEl = container.querySelector('#sg-ignored-count');
+      if (countEl) countEl.textContent = `(${entries.length})`;
+      const listEl = container.querySelector('#sg-ignored-list');
+      if (!listEl) return;
+      if (entries.length === 0) {
+        listEl.innerHTML =
+          '<div class="sg-muted">No ignored books. Click Ignore on any unlinked book to hide samples, manuals, or non-books without deleting files on your SD card.</div>';
+        return;
+      }
+      const rowsHtml = entries
+        .map(([key, entry]) => {
+          const sdPath = String(entry.sdPath || key);
+          const meta = extractFilenameMeta(sdPath);
+          const title = entry.title || meta.title || sdPath;
+          const author = entry.author || meta.author || '';
+          return (
+            `<div class="sg-res-row">` +
+              `<div><strong>${escapeHtml(title)}</strong>${author ? ' <span class="sg-muted">by ' + escapeHtml(author) + '</span>' : ''} <span class="sg-muted">· ${escapeHtml(sdPath)}</span></div>` +
+              `<button type="button" class="sg-btn sg-btn-sm" data-ign-act="restore" data-path="${escapeHtml(sdPath)}">Restore</button>` +
+            `</div>`
+          );
+        })
+        .join('');
+      const restoreAllHtml =
+        entries.length > 1
+          ? '<div class="sg-row" style="margin-top:8px"><button type="button" class="sg-btn sg-btn-sm" data-ign-act="restore-all">Restore All</button></div>'
+          : '';
+      listEl.innerHTML = `<div class="sg-results">${rowsHtml}</div>${restoreAllHtml}`;
+      if (busyLock) {
+        for (const btn of listEl.querySelectorAll('button')) {
+          if (!btn.disabled) {
+            btn.dataset.sgWasEnabled = '1';
+            btn.disabled = true;
+          }
+        }
+      }
+    }
+
     function renderAll() {
       renderBooks();
       renderSdBrowser();
+      renderIgnoredBooks();
       syncSettingsInputs();
     }
 
     container.innerHTML =
       '<style>' +
-      '.sg-wrap{--b:var(--border-color,#d1d5db);--a:var(--accent-color,#6e9a82);--ah:var(--accent-hover-color,#5a8c73);--m:var(--label-color,#6b7280);--c:var(--card-bg,#fff);--g:var(--bg,#f3f4f6);--f:var(--font-color,#1f2933);--t:var(--title-color,#111827);--s:var(--accent-soft,rgba(110,154,130,0.12));display:flex;flex-direction:column;gap:10px;font-size:0.93em;color:var(--f)}' +
+      '.sg-wrap,.sg-sync-prog{--b:var(--border-color,#d1d5db);--a:var(--accent-color,#6e9a82);--ah:var(--accent-hover-color,#5a8c73);--m:var(--label-color,#6b7280);--c:var(--card-bg,#fff);--g:var(--bg,#f3f4f6);--f:var(--font-color,#1f2933);--t:var(--title-color,#111827);--s:var(--accent-soft,rgba(110,154,130,0.12));font-size:0.93em;color:var(--f)}' +
+      '.sg-wrap{display:flex;flex-direction:column;gap:10px}' +
       '.sg-wrap.sg-busy{opacity:0.88}' +
       '.sg-head{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:10px}' +
       '.sg-head-title{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:2px}' +
@@ -6043,9 +6629,17 @@
       '.sg-history-date{color:var(--f);font-weight:500;white-space:nowrap}' +
       '.sg-history-meta{color:var(--m)}' +
       '.sg-history-foot{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;margin-top:4px;padding-top:5px;border-top:1px solid var(--b)}' +
-      '.sg-progress{flex:1;height:5px;border-radius:999px;background:var(--b);overflow:hidden;max-width:260px;min-width:80px}' +
-      '.sg-progress-fill{height:100%;border-radius:999px;background:var(--a)}' +
+      '.sg-progress{position:relative;flex:1;height:7px;border-radius:999px;background:var(--b);overflow:hidden;max-width:260px;min-width:80px}' +
+      '.sg-progress-fill,.sg-progress-synced{position:absolute;top:0;left:0;bottom:0;border-radius:999px;background:var(--a);transition:width .45s cubic-bezier(.22,1,.36,1),background-color .25s ease,opacity .25s ease}' +
+      '.sg-progress-fill.sg-progress-ahead{opacity:0.35}' +
+      '.sg-progress-done{background:#16a34a}' +
+      '.sg-book.sg-linking{border-color:var(--a);box-shadow:0 0 0 2px var(--s)}' +
       '.sg-linker{border-top:1px dashed var(--b);padding-top:10px;display:flex;flex-direction:column;gap:10px}' +
+      '.sg-linker-head{font-size:0.84em;color:var(--m);display:flex;justify-content:space-between;align-items:center}' +
+      '.sg-enter{animation:sg-reveal .22s cubic-bezier(.22,1,.36,1)}' +
+      '.sg-flash{animation:sg-flash 1.4s ease}' +
+      '.sg-searching{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px dashed var(--b);border-radius:6px;background:var(--g)}' +
+      '.sg-spinner{width:14px;height:14px;border:2px solid var(--b);border-top-color:var(--a);border-radius:50%;flex-shrink:0;animation:sg-spin .75s linear infinite}' +
       '.sg-subsec{display:flex;flex-direction:column;gap:6px}' +
       '.sg-chip-list{display:flex;flex-wrap:wrap;gap:6px}' +
       '.sg-results{display:flex;flex-direction:column;gap:6px;max-height:220px;overflow:auto}' +
@@ -6056,27 +6650,67 @@
       '.sg-pill-ready{background:rgba(37,99,235,0.14);border-color:rgba(37,99,235,0.3);color:#1d4ed8}' +
       '.sg-pill-dates{background:rgba(37,99,235,0.1);border-color:rgba(37,99,235,0.28);color:#1d4ed8}' +
       '.sg-pill-unlinked,.sg-pill-muted{background:var(--s);border-color:var(--b);color:var(--m)}' +
-      '.sg-banner{padding:6px 10px;border-radius:6px;border:1px solid var(--b);background:var(--g);font-size:0.86em}' +
+      '.sg-banner{padding:6px 10px;border-radius:6px;border:1px solid var(--b);background:var(--g);font-size:0.86em;transition:background-color .2s,border-color .2s}' +
       '.sg-banner.sg-ok{background:rgba(22,163,74,0.1);border-color:rgba(22,163,74,0.35)}' +
       '.sg-banner.sg-err{background:rgba(220,38,38,0.1);border-color:rgba(220,38,38,0.35)}' +
       '.sg-sd-bar{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;margin:10px 0}' +
       '.sg-sd-crumbs{display:flex;flex-wrap:wrap;gap:4px;align-items:center}' +
       '.sg-sd-list{display:flex;flex-direction:column;gap:6px;max-height:260px;overflow:auto}' +
       '.sg-sd-dir{font-weight:600}' +
-      '.sg-sync-prog{display:none;margin-top:2px}' +
-      '.sg-sync-prog.show{display:block}' +
-      '.sg-sync-bar{width:100%;height:20px;background-color:var(--b);border-radius:999px;overflow:hidden}' +
-      '.sg-sync-fill{height:100%;background-color:var(--a);width:0%;transition:width .3s}' +
-      '.sg-sync-text{text-align:center;margin-top:5px;font-size:.88em;color:var(--m)}' +
+      '.sg-sync-prog{position:fixed;inset:0;width:100%;height:100%;margin:0;padding:16px;box-sizing:border-box;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.48);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);opacity:0;visibility:hidden;pointer-events:none;transition:opacity .2s ease,visibility .2s}' +
+      '.sg-sync-prog.show{opacity:1;visibility:visible;pointer-events:auto}' +
+      '.sg-sync-card{width:min(440px,100%);background:var(--c);border:1px solid var(--b);border-radius:12px;padding:18px 20px;box-sizing:border-box;box-shadow:0 18px 48px rgba(0,0,0,0.32),0 2px 8px rgba(0,0,0,0.14);transform:scale(0.96);transition:transform .22s cubic-bezier(.22,1,.36,1),border-color .22s ease}' +
+      '.sg-sync-prog.show .sg-sync-card{transform:scale(1)}' +
+      '.sg-sync-prog.active .sg-sync-card{border-color:var(--a)}' +
+      '.sg-sync-prog.done .sg-sync-card{border-color:rgba(22,163,74,0.5)}' +
+      '.sg-sync-prog.err .sg-sync-card{border-color:rgba(220,38,38,0.55)}' +
+      '.sg-sync-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:7px}' +
+      '.sg-sync-status{display:inline-flex;align-items:center;gap:7px;font-weight:600;font-size:0.88em;color:var(--t);min-width:0}' +
+      '.sg-sync-icon{width:14px;height:14px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;font-size:0.82em;font-weight:700;border-radius:50%}' +
+      '.sg-sync-prog.active .sg-sync-icon{border:2px solid var(--b);border-top-color:var(--a);box-sizing:border-box;animation:sg-spin .75s linear infinite}' +
+      '.sg-sync-prog.done .sg-sync-icon{background:rgba(22,163,74,0.16);color:#15803d}' +
+      '.sg-sync-prog.done .sg-sync-icon::before{content:"✓"}' +
+      '.sg-sync-prog.err .sg-sync-icon{background:rgba(220,38,38,0.16);color:#b91c1c}' +
+      '.sg-sync-prog.err .sg-sync-icon::before{content:"!"}' +
+      '.sg-sync-prog.cancelled .sg-sync-card{border-color:rgba(217,119,6,0.5)}' +
+      '.sg-sync-prog.cancelled .sg-sync-icon{background:rgba(217,119,6,0.16);color:#b45309}' +
+      '.sg-sync-prog.cancelled .sg-sync-icon::before{content:"■"}' +
+      '.sg-sync-bar{width:100%;height:8px;background-color:var(--b);border-radius:999px;overflow:hidden;position:relative}' +
+      '.sg-sync-fill{height:100%;background-color:var(--a);border-radius:999px;width:0%;position:relative;overflow:hidden;transition:width .42s cubic-bezier(.22,1,.36,1),background-color .25s ease}' +
+      '.sg-sync-fill.sg-no-anim{transition:none!important}' +
+      '.sg-sync-prog.active .sg-sync-fill::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent 0%,rgba(255,255,255,0.32) 50%,transparent 100%);animation:sg-shimmer 1.3s ease-in-out infinite}' +
+      '.sg-sync-prog.done .sg-sync-fill{background-color:#16a34a}' +
+      '.sg-sync-prog.err .sg-sync-fill{background-color:var(--danger-color,#dc2626)}' +
+      '.sg-sync-prog.cancelled .sg-sync-fill{background-color:#d97706}' +
+      '.sg-sync-text{margin-top:6px;font-size:.82em;color:var(--m);line-height:1.35;word-break:break-word}' +
+      '.sg-sync-foot{display:none;justify-content:flex-end;margin-top:10px}' +
+      '.sg-sync-prog.active.cancellable .sg-sync-foot{display:flex}' +
+      '.sg-sync-right{display:flex;align-items:center;gap:6px;flex-shrink:0}' +
+      '.sg-sync-pct{font-variant-numeric:tabular-nums;font-weight:600;font-size:0.86em;color:var(--f)}' +
+      '.sg-sync-dismiss{display:none;background:transparent;border:none;color:var(--m);cursor:pointer;font-size:1.15em;line-height:1;padding:0 4px;border-radius:4px}' +
+      '.sg-sync-dismiss:hover{color:var(--f);background:var(--g)}' +
+      '.sg-sync-prog.done .sg-sync-dismiss,.sg-sync-prog.err .sg-sync-dismiss,.sg-sync-prog.cancelled .sg-sync-dismiss{display:inline-block}' +
       '.sg-import-box{display:none;margin-top:10px;padding:10px 12px;border-radius:6px;border:1px solid var(--b);background:var(--g);flex-direction:column;gap:8px}' +
       '.sg-import-box.show{display:flex}' +
       '.sg-textarea{width:100%;min-height:96px;padding:8px 10px;border:1px solid var(--b);border-radius:6px;background:var(--c);color:var(--f);box-sizing:border-box;font-family:monospace;font-size:0.84em;resize:vertical}' +
       '.sg-check{display:inline-flex;align-items:center;gap:6px;cursor:pointer}' +
       '.sg-muted{color:var(--m);font-size:0.86em}.sg-ok{color:#15803d;font-weight:600}.sg-warn{color:#b45309;font-size:0.86em;font-weight:600}.sg-err{color:#b91c1c;font-weight:600}' +
+      '@keyframes sg-shimmer{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}' +
+      '@keyframes sg-reveal{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}' +
+      '@keyframes sg-flash{0%{border-color:var(--a);box-shadow:0 0 0 3px var(--s)}100%{border-color:var(--b);box-shadow:none}}' +
+      '@keyframes sg-spin{to{transform:rotate(360deg)}}' +
+      '@media(prefers-reduced-motion:reduce){.sg-progress-fill,.sg-progress-synced,.sg-sync-prog,.sg-sync-card,.sg-sync-fill,.sg-banner{transition:none}.sg-sync-prog.active .sg-sync-fill::after,.sg-sync-prog.active .sg-sync-icon,.sg-enter,.sg-flash,.sg-spinner{animation:none}}' +
       '@media(prefers-color-scheme:dark){' +
       '.sg-pill-done,.sg-ok{color:#4ade80}' +
       '.sg-pill-pending,.sg-warn{color:#fbbf24}' +
       '.sg-pill-ready,.sg-pill-dates{color:#93c5fd}' +
+      '.sg-progress-done,.sg-sync-prog.done .sg-sync-fill{background-color:#22c55e}' +
+      '.sg-sync-prog.err .sg-sync-fill{background-color:#f87171}' +
+      '.sg-sync-prog.cancelled .sg-sync-fill{background-color:#fbbf24}' +
+      '.sg-sync-card{box-shadow:0 20px 56px rgba(0,0,0,0.62),0 2px 10px rgba(0,0,0,0.35)}' +
+      '.sg-sync-prog.done .sg-sync-icon{color:#4ade80}' +
+      '.sg-sync-prog.err .sg-sync-icon{color:#f87171}' +
+      '.sg-sync-prog.cancelled .sg-sync-icon{color:#fbbf24}' +
       '.sg-err,.sg-btn-ghost.sg-btn-danger:hover:not(:disabled){color:#f87171}' +
       '}' +
       '</style>' +
@@ -6093,7 +6727,6 @@
           '</div>' +
         '</div>' +
         '<div id="sg-banner" class="sg-banner sg-muted">Ready.</div>' +
-        '<div id="sg-sync-progress" class="sg-sync-prog" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="sg-sync-bar"><div id="sg-sync-fill" class="sg-sync-fill"></div></div><div id="sg-sync-text" class="sg-sync-text"></div></div>' +
         '<div class="sg-drawers">' +
           '<details class="sg-details" id="sg-account-details">' +
             '<summary>Account Settings <span id="sg-cookie-badge" class="sg-muted" style="font-weight:400;margin-left:8px"></span></summary>' +
@@ -6165,6 +6798,10 @@
                 '<button type="button" class="sg-btn sg-btn-sm" id="sg-history-import-cancel">Close</button>' +
               '</div>' +
             '</div>' +
+            '<details class="sg-subdetails" id="sg-ignored-details" style="margin-top:10px">' +
+              '<summary>Ignored Books <span id="sg-ignored-count" class="sg-muted" style="font-weight:400;margin-left:6px">(0)</span></summary>' +
+              '<div id="sg-ignored-list" style="margin-top:8px"></div>' +
+            '</details>' +
           '</details>' +
           '<details class="sg-details" id="sg-sd-details">' +
             '<summary>Browse SD Library <span id="sg-sd-badge" class="sg-muted" style="font-weight:400;margin-left:8px"></span></summary>' +
@@ -6190,6 +6827,23 @@
           '</div>' +
         '</div>' +
         '<div id="sg-books-list"></div>' +
+      '</div>' +
+      '<div id="sg-sync-progress" class="sg-sync-prog" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-hidden="true">' +
+        '<div class="sg-sync-card">' +
+          '<div class="sg-sync-head">' +
+            '<div class="sg-sync-status">' +
+              '<span class="sg-sync-icon" aria-hidden="true"></span>' +
+              '<span id="sg-sync-op" class="sg-sync-op">Syncing</span>' +
+            '</div>' +
+            '<div class="sg-sync-right">' +
+              '<span id="sg-sync-pct" class="sg-sync-pct">0%</span>' +
+              '<button type="button" id="sg-sync-dismiss" class="sg-sync-dismiss" title="Dismiss progress bar" aria-label="Dismiss progress bar">×</button>' +
+            '</div>' +
+          '</div>' +
+          '<div class="sg-sync-bar"><div id="sg-sync-fill" class="sg-sync-fill"></div></div>' +
+          '<div id="sg-sync-text" class="sg-sync-text"></div>' +
+          '<div class="sg-sync-foot"><button type="button" id="sg-sync-cancel" class="sg-btn sg-btn-sm sg-btn-danger" title="Stop batch cleanly after the current book finishes">Cancel</button></div>' +
+        '</div>' +
       '</div>';
 
     container.querySelector('#sg-cookie-input').addEventListener('input', (e) => {
@@ -6311,6 +6965,52 @@
         setBanner(String(err && err.message ? err.message : err), 'err');
       }
     });
+    const syncDismissBtn = container.querySelector('#sg-sync-dismiss');
+    if (syncDismissBtn) syncDismissBtn.addEventListener('click', hideSyncProgress);
+    const syncCancelBtn = container.querySelector('#sg-sync-cancel');
+    if (syncCancelBtn) syncCancelBtn.addEventListener('click', requestBatchCancel);
+    const syncProgBox = container.querySelector('#sg-sync-progress');
+    if (syncProgBox) {
+      syncProgBox.addEventListener('click', (e) => {
+        if (e && e.target === syncProgBox && !syncProgBox.classList.contains('active')) {
+          hideSyncProgress();
+        }
+      });
+    }
+    const ignoredListEl = container.querySelector('#sg-ignored-list');
+    if (ignoredListEl) {
+      ignoredListEl.addEventListener('click', async (e) => {
+        const btn = e && e.target ? e.target.closest('button[data-ign-act]') : null;
+        if (!btn) return;
+        const act = btn.getAttribute('data-ign-act');
+        try {
+          if (act === 'restore') {
+            const sdPath = btn.getAttribute('data-path');
+            if (!sdPath) return;
+            const meta = extractFilenameMeta(sdPath);
+            if (unignoreBookInMap(mapData, { sdPath, normFilename: meta.normFilename })) {
+              await saveMapData();
+            }
+            flashKey = sdPath;
+            renderBooks();
+            renderSdBrowser();
+            renderIgnoredBooks();
+            setBanner(`Restored "${meta.title}" to book list.`, 'ok');
+          } else if (act === 'restore-all') {
+            const count = Object.keys((mapData && mapData.ignored) || {}).length;
+            if (!count) return;
+            mapData.ignored = {};
+            await saveMapData();
+            renderBooks();
+            renderSdBrowser();
+            renderIgnoredBooks();
+            setBanner(`Restored ${count} ignored book(s).`, 'ok');
+          }
+        } catch (err) {
+          setBanner(String(err && err.message ? err.message : err), 'err');
+        }
+      });
+    }
 
     container.querySelector('#sg-sd-details').addEventListener('toggle', (e) => {
       const target = e && e.target ? e.target : container.querySelector('#sg-sd-details');
@@ -6327,10 +7027,26 @@
         await loadSdFolder(btn.getAttribute('data-path') || '/');
       } else if (act === 'reload') {
         await loadSdFolder(sdBrowserPath);
+      } else if (act === 'unignore-book') {
+        const sdPath = btn.getAttribute('data-path');
+        if (!sdPath) return;
+        const meta = extractFilenameMeta(sdPath);
+        if (unignoreBookInMap(mapData, { sdPath, normFilename: meta.normFilename })) {
+          await saveMapData();
+        }
+        flashKey = sdPath;
+        renderBooks();
+        renderSdBrowser();
+        renderIgnoredBooks();
+        setBanner(`Restored "${meta.title}" to book list.`, 'ok');
       } else if (act === 'add-book') {
         const sdPath = btn.getAttribute('data-path');
         if (!sdPath) return;
         const meta = extractFilenameMeta(sdPath);
+        if (unignoreBookInMap(mapData, { sdPath, normFilename: meta.normFilename, documentHash: '' })) {
+          await saveMapData();
+          renderIgnoredBooks();
+        }
         if (!outboxBooks.has(sdPath) && !findMappingForBook(mapData, {
           sdPath,
           documentHash: '',
@@ -6347,22 +7063,21 @@
           });
         }
         activeLinkKey = sdPath;
+        if (bookSearchQuery) {
+          bookSearchQuery = '';
+          const bookSearchInp = container.querySelector('#sg-book-search');
+          if (bookSearchInp) bookSearchInp.value = '';
+        }
         if (activeFilter !== 'all' && activeFilter !== 'unlinked') {
           activeFilter = 'all';
         }
         sectionOpenState.unlinked = true;
-        renderBooks();
+        linkerEnterKey = sdPath;
+        flashKey = sdPath;
         renderSdBrowser();
+        renderBooks();
+        focusLinkerUi(sdPath);
         setBanner(`Ready to link "${meta.title}" — choose an edition below.`, 'muted');
-        const linkerInput = Array.from(container.querySelectorAll('input[data-role="search-q"]')).find(
-          (el) => el.getAttribute('data-key') === sdPath
-        );
-        if (linkerInput) {
-          if (typeof linkerInput.scrollIntoView === 'function') {
-            linkerInput.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          }
-          if (typeof linkerInput.focus === 'function') linkerInput.focus();
-        }
       }
     });
 
@@ -6385,38 +7100,102 @@
           if (await confirmAction(`Unlink "${row.title}" from StoryGraph?`)) {
             delete mapData.books[row.sdPath];
             await saveMapData();
-            renderBooks();
+            flashKey = row.key;
+            renderBooks({ scrollToKey: row.key, scrollBlock: 'nearest' });
             renderSdBrowser();
             setBanner(`Unlinked "${row.title}".`, 'muted');
           }
         } else if (act === 'toggle-link') {
-          activeLinkKey = activeLinkKey === key ? null : key;
-          renderBooks();
+          const opening = activeLinkKey !== key;
+          activeLinkKey = opening ? key : null;
+          if (opening) {
+            linkerEnterKey = key;
+            sectionOpenState.unlinked = true;
+            renderBooks();
+            focusLinkerUi(key);
+          } else {
+            renderBooks({ anchorKey: key });
+          }
         } else if (act === 'remove-staged') {
           stagedBooks.delete(key);
           if (activeLinkKey === key) activeLinkKey = null;
           renderBooks();
           renderSdBrowser();
           setBanner(`Removed "${row.title}" from list.`, 'muted');
+        } else if (act === 'ignore-book') {
+          ignoreBookInMap(mapData, row);
+          if (activeLinkKey === key) activeLinkKey = null;
+          await saveMapData();
+          renderBooks();
+          renderSdBrowser();
+          renderIgnoredBooks();
+          setBanner(`Ignored "${row.title}". Restore anytime under Tools & Preferences.`, 'muted');
         } else if (act === 'pick-cr') {
           const bid = btn && btn.getAttribute('data-bookid');
           const cr = currentReads.find((c) => c.bookId === bid);
           if (cr) await linkBook(row, Object.assign({ status: 'currently-reading' }, cr));
         } else if (act === 'search') {
-          const qInput = container.querySelector(`input[data-role="search-q"][data-key="${CSS.escape ? CSS.escape(key) : key}"]`) ||
-            Array.from(container.querySelectorAll('input[data-role="search-q"]')).find((el) => el.getAttribute('data-key') === key);
+          const qInput = Array.from(container.querySelectorAll('input[data-role="search-q"]')).find(
+            (el) => el.getAttribute('data-key') === key
+          );
           const audioCb = Array.from(container.querySelectorAll('input[data-role="include-audio"]')).find(
             (el) => el.getAttribute('data-key') === key
           );
-          const query = (qInput && qInput.value ? qInput.value : row.title).trim();
-          const includeAudio = Boolean(audioCb && audioCb.checked);
+          const query = (qInput && qInput.value ? qInput.value : searchQueryByKey[key] || row.title).trim();
+          const includeAudio = audioCb ? Boolean(audioCb.checked) : Boolean(includeAudioByKey[key]);
+          searchQueryByKey[key] = query;
+          includeAudioByKey[key] = includeAudio;
           await runExclusive(`Searching StoryGraph for "${query}"...`, async () => {
-            const url = `${BASE_URL}/browse?search_term=${encodeURIComponent(query)}`;
-            const html = await fetchStoryGraphHtml(url);
-            const parsed = parseStoryGraphSearch(html, includeAudio);
-            searchResultsByKey[key] = parsed.results || [];
-            renderBooks();
-            setBanner(`Found ${searchResultsByKey[key].length} edition(s) for "${query}".`, 'ok');
+            searchingKey = key;
+            renderBooks({ anchorKey: key });
+            setSyncProgress(25, `Searching StoryGraph for "${query}"...`, 'active', 'Searching');
+            try {
+              const url = `${BASE_URL}/browse?search_term=${encodeURIComponent(query)}`;
+              const html = await fetchStoryGraphHtml(url);
+              const parsed = parseStoryGraphSearch(html, includeAudio);
+              searchResultsByKey[key] = parsed.results || [];
+              resultsEnterKey = key;
+              setSyncProgress(
+                100,
+                `100% — Found ${searchResultsByKey[key].length} edition(s) for "${query}"`,
+                'done',
+                'Search complete'
+              );
+              scheduleSyncAutoHide(1100);
+              setBanner(`Found ${searchResultsByKey[key].length} edition(s) for "${query}".`, 'ok');
+            } catch (err) {
+              setSyncProgress(
+                Math.max(25, syncProgState.real || 25),
+                String(err && err.message ? err.message : err),
+                'err',
+                'Search failed'
+              );
+              throw err;
+            } finally {
+              searchingKey = null;
+              renderBooks({ anchorKey: key });
+              if (activeLinkKey === key) {
+                const ensureLinkerVisible = () => {
+                  const card = findBookCardEl(container.querySelector('#sg-books-list'), key);
+                  const linker = card ? card.querySelector('.sg-linker') : null;
+                  if (
+                    linker &&
+                    typeof linker.getBoundingClientRect === 'function' &&
+                    typeof window !== 'undefined' &&
+                    typeof window.innerHeight === 'number' &&
+                    typeof linker.scrollIntoView === 'function' &&
+                    linker.getBoundingClientRect().bottom > window.innerHeight
+                  ) {
+                    linker.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                  }
+                };
+                if (typeof requestAnimationFrame === 'function') {
+                  requestAnimationFrame(ensureLinkerVisible);
+                } else {
+                  ensureLinkerVisible();
+                }
+              }
+            }
           });
         } else if (act === 'pick-res') {
           const bid = btn && btn.getAttribute('data-bookid');
@@ -6438,7 +7217,22 @@
       }
     }
 
-    container.querySelector('#sg-books-list').addEventListener('keydown', async (e) => {
+    const booksListEl = container.querySelector('#sg-books-list');
+    booksListEl.addEventListener('input', (e) => {
+      const inp = e && e.target;
+      const role = inp && typeof inp.getAttribute === 'function' ? inp.getAttribute('data-role') : null;
+      if (role !== 'search-q') return;
+      const key = inp.getAttribute('data-key');
+      if (key) searchQueryByKey[key] = String(inp.value || '');
+    });
+    booksListEl.addEventListener('change', (e) => {
+      const inp = e && e.target;
+      const role = inp && typeof inp.getAttribute === 'function' ? inp.getAttribute('data-role') : null;
+      if (role !== 'include-audio') return;
+      const key = inp.getAttribute('data-key');
+      if (key) includeAudioByKey[key] = Boolean(inp.checked);
+    });
+    booksListEl.addEventListener('keydown', async (e) => {
       if (!e || e.key !== 'Enter') return;
       const inp = e.target;
       const role = inp && typeof inp.getAttribute === 'function' ? inp.getAttribute('data-role') : null;
@@ -6449,7 +7243,7 @@
       await handleBookAction(role === 'search-q' ? 'search' : 'link-direct', key, null);
     });
 
-    container.querySelector('#sg-books-list').addEventListener('click', async (e) => {
+    booksListEl.addEventListener('click', async (e) => {
       const btn = e.target.closest('button[data-act]');
       if (!btn) return;
       await handleBookAction(btn.getAttribute('data-act'), btn.getAttribute('data-key'), btn);
